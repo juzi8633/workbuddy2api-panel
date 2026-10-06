@@ -30,6 +30,11 @@ update; resolve it in our fork and rerun. Review failed Actions runs to catch
 conflicts promptly. GitHub can disable scheduled workflows after prolonged
 inactivity; re-enable them in our fork's Actions tab when necessary.
 
+The sync job runs its own tests before pushing. A push using `GITHUB_TOKEN` does
+not trigger other workflows, so Docker images and binary artifacts are not
+rebuilt automatically by a sync. Run the existing build workflows manually in
+our fork when updated release artifacts are needed.
+
 `bash scripts/sync-upstream.sh` offers the same operation from a clean local
 `main` checkout with Go and Node installed and our fork configured as `origin`.
 It refuses any other origin push URL. The upstream push URL is disabled in the
