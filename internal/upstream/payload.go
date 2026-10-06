@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
+	"sync"
 )
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
@@ -42,6 +43,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// /console 同源）只认 max_tokens——别名透传会被上游忽略后回落默认输出上限
 	// （实测 32000），长流任务被截。
 	translateMaxCompletionTokens(obj)
+	clampGPTMinMaxTokens(obj)
 	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
 	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
 	if _, has := obj["stream_options"]; !has {
@@ -123,8 +125,61 @@ func translateMaxCompletionTokens(obj map[string]any) {
 	}
 }
 
+// gptMinMaxTokens GPT 系上游接受的 max_tokens 下限。
+const gptMinMaxTokens = 16
+
+// clampGPTMinMaxTokens 把 GPT 系模型过小的 max_tokens 抬到下限。
+//
+// 背景：上游 GPT 系（实测 gpt-6-sol / gpt-6-luna / gpt-5.6-sol）对 max_tokens < 16
+// 一律 400 code=11133 model_param_invalid（15 拒、16 过，同号同 body 对照）；hy4 等
+// 非 GPT 模型无此限制。Claude Code 切模型时发 max_tokens 极小的探针，全号轮转同样
+// 被拒 → 客户端 503，模型永远切不过去。账号与 body 其余部分无关，换号无用，只能
+// 在发送前修。抬到下限只放宽输出上限、不改语义；未携带字段 / 非数值 / 已达下限一律不动。
+func clampGPTMinMaxTokens(obj map[string]any) {
+	model, _ := obj["model"].(string)
+	if !strings.Contains(strings.ToLower(model), "gpt-") {
+		return
+	}
+	var v int64
+	switch n := obj["max_tokens"].(type) {
+	case float64:
+		v = int64(n)
+	case int64:
+		v = n
+	case int:
+		v = int64(n)
+	default:
+		return
+	}
+	if v < gptMinMaxTokens {
+		obj["max_tokens"] = int64(gptMinMaxTokens)
+		log.Printf("max_tokens clamped model=%s %d -> %d", model, v, gptMinMaxTokens)
+	}
+}
+
 // effortRank 档位从低到高。
 var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
+
+// effortRewriteLogged 记录「本进程内已打印过」的 reasoning_effort 改写组合。
+//
+// 为什么需要：降档是**按模型能力**决定的，档位组合是有限的小集合（实测生产
+// deepseek-v4.1-flash + claude-cli 固定发 medium，13 小时里 1368 行日志全是同一句
+// `medium -> low`）。每请求一行会把 journal 淹掉——请求行被挤到看不见，排查真问题
+// 时得先翻过几千行噪音。
+//
+// 去重键是「模型 + 请求档 + 实际档 + 方向」，所以：换模型、换档位、或档位映射变化
+// （上游调整 supportedEfforts）都会重新打印一次——**有信息量的变化一条都不会丢**，
+// 丢掉的只有同一组合的重复。同组合首次出现必然打印，不存在"静默改写"。
+var effortRewriteLogged sync.Map
+
+// logEffortRewriteOnce 每个「模型+请求档+实际档+方向」组合只打印一次。
+func logEffortRewriteOnce(kind, model, from, to string) {
+	key := kind + "|" + model + "|" + from + "|" + to
+	if _, loaded := effortRewriteLogged.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	log.Printf("reasoning_effort %s model=%s %s -> %s（同组合本进程内只打印一次）", kind, model, from, to)
+}
 
 // normalizeReasoningEffort 按模型 supportedEfforts 降级 reasoning_effort（snake/camel 双字段兼容）。
 //   - 请求档位模型支持 → 原样透传
@@ -171,7 +226,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if best != "" {
 		if !strings.EqualFold(best, reqStr) {
 			obj[key] = best
-			log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
+			logEffortRewriteOnce("downgraded", model, reqStr, best)
 		}
 		return
 	}
@@ -185,7 +240,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	}
 	if lowest != "" {
 		obj[key] = lowest
-		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
+		logEffortRewriteOnce("floored", model, reqStr, lowest)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -538,6 +539,66 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// 配置表单与 CFG_MAP 必须一一对应，且面板声称"可在线改"的热生效键必须真的
+// 出现在表单里。
+//
+// 为什么需要：`logging.request_client_info` 曾经在表单里存在过，后来在某次改动中
+// 被连带删掉，而 Go 侧的配置键、livecfg 热生效通路、README 的描述都还在——面板
+// 少了一个开关而 Go 测试全绿，只有人肉点开配置页才会发现。这里把"表单字段 ↔
+// CFG_MAP"与"关键热改键必须在表单里"两条都钉住。
+func TestConfigFormMatchesCFGMap(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(src)
+	htmlBytes, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBytes)
+
+	// CFG_MAP 块（下面两条检查共用）。
+	mapBlock := js[strings.Index(js, "const CFG_MAP = {"):]
+	mapBlock = mapBlock[:strings.Index(mapBlock, "\n};")]
+	// 不能按行首匹配：CFG_MAP 里多个键写在同一行（`a: [...], b: [...]`），只有行首
+	// 那个带换行缩进。按「前面是行首或分隔符」判定才不漏。
+	inMap := func(name string) bool {
+		return regexp.MustCompile(`(?:^|[\s,{])` + regexp.QuoteMeta(name) + `:\s*\[`).MatchString(mapBlock)
+	}
+
+	// 1) 表单里的每个 name 都要有 CFG_MAP 条目（否则收集/回填都拿不到它）。
+	form := html[strings.Index(html, `<form id="cfgForm">`):]
+	form = form[:strings.Index(form, "</form>")]
+	names := map[string]bool{}
+	for _, m := range regexp.MustCompile(`name="([a-z_0-9]+)"`).FindAllStringSubmatch(form, -1) {
+		names[m[1]] = true
+	}
+	if len(names) == 0 {
+		t.Fatal("未从配置表单解析出任何 name 字段")
+	}
+	for n := range names {
+		if !inMap(n) {
+			t.Errorf("表单字段 %q 在 CFG_MAP 里没有条目（保存时会被静默丢弃）", n)
+		}
+	}
+
+	// 2) CFG_MAP 里的每个键都要在表单里有控件（否则回填/保存是空转）。
+	for _, m := range regexp.MustCompile(`(?:^|[\s,{])([a-z_0-9]+):\s*\[`).FindAllStringSubmatch(mapBlock, -1) {
+		if !names[m[1]] {
+			t.Errorf("CFG_MAP 键 %q 在配置表单里没有对应控件", m[1])
+		}
+	}
+
+	// 3) 明确断言这一个键：后端有配置项、README 说面板可改，UI 不能少。
+	if !strings.Contains(js, "request_client_info: ['logging', 'request_client_info']") {
+		t.Error("CFG_MAP 缺 request_client_info 条目")
+	}
+	if !names["request_client_info"] {
+		t.Error("配置表单缺「记录调用来源」开关（logging.request_client_info）")
+	}
+}
+
 // 同到期时间按面额降序；其余未用完包与零/负余额包分别聚合。
 func TestAppJSDetailGroups(t *testing.T) {
 	node, err := exec.LookPath("node")
@@ -643,5 +704,97 @@ process.stdout.write(JSON.stringify({
 	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"#4f8cff","colorB":"#25b08b"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry summary=%s want %s", out, want)
+	}
+}
+
+// TestUsageChartCreditSeries 用量图的积分序列必须在 Node 里真跑一遍——三种形态
+// 各断言一次（issue #58 的渲染契约）：
+//
+//	形态 1「全 0 观测」：credit_samples=1 且 credits=0（明确免费）→ **必须画点**。
+//	        这是修复前的实际缺陷：条件写成 hasCr && maxCr>0，全 0 时 maxCr=0，
+//	        整条积分轴连同圆点一起消失，于是"观测到 0 分"退化成"没有数据"。
+//	形态 2「混合」：一个 0 分 + 一个 2.5 分 → 两点 + 一条折线。
+//	形态 3「无观测」：credit_samples=0 → 不画积分轴（不能捏造一条零线）。
+//
+// 为什么必须跑真代码：app.js 是 go:embed 的静态资源，Go 编译器不检查其内容；
+// 上面的 TestAppJSSyntax 只保证"语法能解析"，算错/条件写错它一样全绿。
+// 无 node 环境时跳过（与 TestAppJSSyntax 同策略，不阻塞无 Node 的构建机）。
+func TestUsageChartCreditSeries(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; skipping chart behaviour check")
+	}
+	path, err := filepath.Abs("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := filepath.Abs("testdata/chart_credit_check.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, script, path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("用量图积分序列渲染不符合契约:\n%s", out)
+	}
+}
+
+// TestAppJSCollectConfigClearable 钉住 collectConfig 的空串语义。
+//
+// 覆盖型字段（user_agent / prompt_file）空串必须照发：漏发会让面板显示"已保存"
+// 而 config.json 里的值没变（issue #102 附带发现 2）。
+//
+// 同时钉住反面：其余文本字段空串仍然不下发。这条同样重要——若哪天为了修上面那个
+// 问题改成"所有空串都发"，表单里任何一个没填的框都会变成"请清空"，静默抹掉配置。
+func TestAppJSCollectConfigClearable(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; collectConfig test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const CFG_MAP');
+const end = src.indexOf('/* Go 时长字段即时校验');
+if (start < 0 || end < 0 || end < start) throw new Error('collectConfig region not found');
+const mk = v => ({ type: 'text', value: v });
+const cfgForm = { elements: {
+  listen: mk(''),
+  api_key: mk('secret'),
+  user_agent: mk(''),
+  prompt_file: mk(''),
+  checkin_hours: mk(''),
+}};
+const ctx = {
+  Date, Number, String, Math, Map, Array, Object, isNaN, URLSearchParams, Set,
+  document: { getElementById: id => (id === 'cfgForm' ? cfgForm : null) },
+  $: id => (id === 'cfgForm' ? cfgForm : null),
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
+const out = ctx.collectConfig();
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
+process.stdout.write(JSON.stringify([
+  has(out.upstream, 'user_agent'), (out.upstream || {}).user_agent,
+  has(out.prompt, 'file'), (out.prompt || {}).file,
+  has(out, 'listen'),
+  has(out.schedule, 'checkin_hours'),
+  out.api_key
+]));`
+	f, err := os.CreateTemp(t.TempDir(), "cfgc-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("collectConfig node test failed: %v\n%s", err, out)
+	}
+	// [user_agent 已发, 其值, prompt.file 已发, 其值, listen 未发, checkin_hours 未发, api_key]
+	const want = `[true,"",true,"",false,false,"secret"]`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
 	}
 }

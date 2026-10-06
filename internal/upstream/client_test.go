@@ -604,10 +604,12 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":128000,"credits":"x0.03 credits","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"effort":"high","summary":"auto"}}
 			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
-			sawIDE = true
+			// 三路 UA 家族并集探测（fetchV3Models）：只有 IDE 那路给完整能力字段，
+			// 其余两路给空目录——断言 IDE 优先级胜出（MaxTokens/Efforts 取 IDE 值）。
 			if r.Header.Get("User-Agent") != codeBuddyIDEUA {
-				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+				return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 			}
+			sawIDE = true
 			if r.Header.Get("X-Product") != "SaaS" {
 				t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
 			}
@@ -648,5 +650,32 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 	}
 	if got := strings.Join(mi.Efforts, ","); got != "low,high,max" {
 		t.Errorf("Efforts=%v want low,high,max", mi.Efforts)
+	}
+}
+
+// TestNonChatModelVideoTags 生成类标签过滤必须覆盖视频两类（上游 PR #107）：
+// 上游桌面端目录带 text-to-video / image-to-video（seedance 系），当成对话模型
+// 选上去只会报 11102。标签大小写/空白不保证规范，须容错。
+func TestNonChatModelVideoTags(t *testing.T) {
+	cases := []struct {
+		name    string
+		id      string
+		maxtok  int64
+		tags    []string
+		wantNon bool
+	}{
+		{"图片生成仍在过滤", "hunyuan-image-alpha", 8192, []string{"text-to-image"}, true},
+		{"文生视频", "seedance-1.0-pro", 8192, []string{"text-to-video"}, true},
+		{"图生视频", "seedance-1.0-lite", 8192, []string{"image-to-video"}, true},
+		{"标签大小写与空白容错", "seedance-x", 8192, []string{" Text-To-Video "}, true},
+		{"多标签其一命中", "x-video", 8192, []string{"chat", "image-to-video"}, true},
+		{"普通对话模型不误伤", "glm-5.2", 8192, []string{"chat", "reasoning"}, false},
+		{"无标签不误伤", "hy3", 8192, nil, false},
+		{"相似但不匹配的标签", "some-model", 8192, []string{"video-to-text"}, false},
+	}
+	for _, c := range cases {
+		if got := nonChatModel(c.id, c.maxtok, c.tags); got != c.wantNon {
+			t.Errorf("%s: nonChatModel(%q,%d,%v) = %v, want %v", c.name, c.id, c.maxtok, c.tags, got, c.wantNon)
+		}
 	}
 }

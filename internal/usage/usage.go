@@ -421,6 +421,16 @@ type Point struct {
 	T     string `json:"t"`
 	Scope string `json:"scope"` // "hour" | "day"
 	Agg
+	// 积分扣除覆盖点：小时/日桶里**同时观测到 credit 与 token** 的样本（issue #58
+	// 「用量界面看积分扣除历史」）。Agg 已带 Credits/CreditSamples，但那些字段在
+	// 逐点场景下要能一眼分辨"本点没观测到积分"与"本点扣了 0 积分"——
+	// CreditSamples=0 即前者，前端据此画断开而非画 0。
+	//
+	// 为什么不直接复用 Agg.Credits：可以，但序列点混在 totals 口径里会让前端
+	// 无法区分「该小时无积分观测」与「该小时扣了 0 分」。显式样本数最省事。
+	//
+	// 注：Agg 里 Credits/CreditSamples/CreditTokens 均已带 json tag，随 Point
+	// 内嵌一并序列化（credits/credit_samples/credit_tokens），此处不再重复字段。
 }
 
 // CreditAgg 积分扣除统计的一行。Key 在账号维度是 UID，在模型维度是裸模型名；

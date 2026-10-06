@@ -112,7 +112,11 @@ jobs:
       - name: tag 与源码版本一致性断言
         run: |
           SRC=$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go)
-          SRC="${SRC%-panel}"   # appVersion 带 -panel 后缀，比对前剥掉
+          # 本 fork 的 appVersion 形如 "1.11.11-wb8"（上游版本 + 本 fork 批号）：
+          # 剥掉 "-wbN" 后缀后与上游 tag 比对，这样发 upstream 版本时该断言仍然有效。
+          # (-panel 是历史后缀，一并剥掉以兼容旧 tag。)
+          SRC="${SRC%-panel}"
+          SRC="${SRC%-wb*}"
           TAG="${GITHUB_REF_NAME#v}"
           if [[ "$GITHUB_REF_NAME" != *-ci ]]; then
             if [[ "$TAG" != "$SRC" ]]; then

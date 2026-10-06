@@ -30,8 +30,30 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.11.11-panel"
+// appVersion 网关版本号 = **批次身份**，透出到 /panel/api/overview 的 version，
+// 同时用作面板静态资源的 cache-busting 键（app.js?v=<它>，见 panel.assetVersion）。
+//
+// 命名规则：<上游版本>-wb<本 fork 第几个发版>
+//
+//	1.11.11      = 上游 v1.11.11（本 fork 的基线）
+//	-wb8         = 本 fork 的第 8 个发版
+//
+// 为什么不再往后面堆特性名（曾经是
+// "1.11.11-panel+freeze+cache+expiry+credits+catalog+filter+hits+evidence"）：
+//   - 一个串同时承担"版本号 / 缓存键 / 变更日志"三件事，结果三件都不合格：
+//     当版本号太长、当指纹不够（同一批内所有构建共享同一值——曾导致两个**不同**的
+//     二进制都报 "1.11.11-panel"，光看版本号分不出）、当日志又必须手打维护（打错
+//     过一次：把 PR #93 的 gofmt 改动写成"排程墙钟修复"）。
+//   - 特性清单的正确归属是 CHANGELOG.md（人读、可写长、不占二进制），
+//     产物指纹的正确归属是 overview 的 build 字段（机器算、自证）。
+//
+// 硬要求：每批发版必须让它变化（cache-busting 依赖"版本一变 URL 一变"）。
+// 加一批就 wb8 → wb9，并把该批内容记进 CHANGELOG.md。
+//
+// 上游 CI 有一条 tag 断言会 `SRC="${SRC%-panel}"` 后比 tag，因此带 "+特性" 的后缀
+// 本就不满足它（我们从没跑过上游 CI）。改成 "-wbN" 同样不满足，但至少是**有意**的
+// 命名，而不是把三件事塞进一个串的副产品。
+const appVersion = "1.12.0-wb17"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -187,6 +209,8 @@ func main() {
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
+		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -222,6 +246,9 @@ func main() {
 		log.Printf("余额后台刷新已禁用（schedule.balance_refresh_enabled=false）")
 	case cfg.BalanceRefreshInterval > 0:
 		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
+	}
+	if cfg.Schedule.IncludeDisabledInTasks {
+		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
 	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
@@ -268,6 +295,7 @@ func main() {
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
 		Version:     appVersion,
+		Build:       panel.SelfBuildID(),
 		Live:        live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
@@ -485,6 +513,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
 		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 
 	return restartRequiredFields(newCfg), nil
 }
@@ -504,6 +533,10 @@ func restartRequiredFields(c *Config) []string {
 		out = append(out, "state_file")
 	}
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
+	// upstream.user_agent 在装配期被写进出站 client（main.go 的 up.UserAgent = ...），
+	// 之后不再读取——不在 livecfg 热快照里，也无法热改。此前漏列，导致面板改完
+	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。
+	out = append(out, "upstream.user_agent")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}

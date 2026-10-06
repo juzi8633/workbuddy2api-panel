@@ -9,12 +9,19 @@ import (
 	"time"
 )
 
+// SetCredits 更新账号余额（credits 变更处）并**同步判定低积分冻结/自动解冻**：
+// 与 SetCreditsDetailed/ReenableIfCredits 同口径，两条余额刷新路径行为一致
+// （面板单号「余额」按钮走这里，用的是权威 UserResource 余额；此前不判冻结，
+// 会出现「余额已 >= 阈值但仍显示冻结」或「余额跌破阈值却不冻结」，
+// 且会写出 frozen=true 而 credits>=阈值 的不自洽 state.json，靠周期刷新才自愈）。
 func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
 		e.creditsTotal = total
+		// 权威余额已更新：低积分冻结/自动解冻跟随判定（见 checkFreezeLocked）。
+		p.checkFreezeLocked(e)
 		p.dirty.Store(true)
 	}
 }
@@ -95,6 +102,8 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, ea
 		e.creditsExpiring = expiring
 		e.creditsEarliestExpiry = earliestAt
 		e.creditsEarliestRemaining = earliestRemaining
+		// 权威余额已更新（签到/余额刷新）：低积分冻结/自动解冻跟随判定。
+		p.checkFreezeLocked(e)
 		p.dirty.Store(true)
 	}
 }
@@ -240,6 +249,16 @@ const (
 // 无此模型、重试无意义，只能换模型/换账号」。resetAt 无需传（11102 无重置文案），
 // ResetAt 保持零值，与 6004 台账共用 Until 判定——11102 条目会以 11102 reason 出现在
 // /status 台账，运维可见。
+// ModelUnavailableReasonPrefix 11102 负缓存条目的 reason 前缀（与
+// upstream.ModelBlockReason 同一字面量）。pool 不 import upstream（会成环），
+// 所以在本包声明一份；两者一致性由 pool 测试断言守住。
+const ModelUnavailableReasonPrefix = "11102"
+
+// IsModelUnavailableReason 报告该条目是否属 11102「模型不可用」类（区别于 6004 限流）。
+func IsModelUnavailableReason(reason string) bool {
+	return strings.HasPrefix(reason, ModelUnavailableReasonPrefix)
+}
+
 func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if uid == "" || model == "" {
 		return
@@ -296,6 +315,64 @@ func (p *Pool) BlockModelClear(uid, model string) {
 		e.modelCooldowns = nil
 	}
 	p.dirty.Store(true)
+}
+
+// ModelBlockStatus 描述某模型在全池范围内因模型级冷却而不可选的情况。
+type ModelBlockStatus struct {
+	Blocked bool      // true = 每个非禁用账号都对该模型处于冷却中
+	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
+	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
+	Count   int       // 因此被挡的账号数
+}
+
+// ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
+//
+// 为什么需要它：选号失败时客户端只会拿到 no_healthy_account（"没有可用账号"），
+// 但真实原因常常是「号都在、只是都对这个模型关闭」。两者对调用方的处置完全不同
+// ——前者该等，后者换个模型才有用——此前却无法区分：首次请求还能看到上游原文
+// （lastErr 非空），一旦负缓存写入，后续请求 lastErr 为空，就只剩"池子没号"
+// （issue #102 附带发现 1）。上游原文与解封时间在那里被丢掉。
+//
+// 跨 realm 判定：调用方失败前已依次尝试过各域，所以只要有**任意**账号还能服务该
+// 模型，就不能算全池阻塞 —— 此时返回 Blocked=false，让上层继续用原有的
+// no_healthy_account 文案（选号失败另有原因：在途占满/积分保底/账号级冷却）。
+//
+// 口径必须与选号一致：用 modelCooled 而非直接查 map，这样 AuditOnly 条目
+// （只审计不拦截）不会被误报成阻塞。
+func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
+	if model == "" {
+		return ModelBlockStatus{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+
+	var st ModelBlockStatus
+	for _, e := range p.byUID {
+		if e.disabled {
+			continue // 禁用号不参与：它的不可用与模型无关
+		}
+		if !e.modelCooled(now, model) {
+			// 还有账号能服务这个模型 → 不是模型级阻塞。
+			return ModelBlockStatus{}
+		}
+		st.Count++
+		if mc, ok := e.modelCooldowns[model]; ok {
+			if st.Reason == "" {
+				st.Reason = mc.Reason
+			}
+			// 取最早解封：那才是"再等多久值得重试"的答案。
+			if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
+				st.Until = mc.Until
+			}
+		}
+	}
+	if st.Count == 0 {
+		// 池里压根没有非禁用账号：这是"真的没号"，不是模型问题。
+		return ModelBlockStatus{}
+	}
+	st.Blocked = true
+	return st
 }
 
 // CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。

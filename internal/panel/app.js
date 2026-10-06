@@ -319,6 +319,14 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
+/* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
+   /panel/api/packages 数据（逐账号实时查上游，能省一次是一次）。声明在路由区
+   是因为 go() 的初始调用就会触发首页卡片的渲染，必须先于它就位。 */
+let lastPackages = null;
+let lastPackagesAt = 0;
+let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
+const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
+
 const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
@@ -330,6 +338,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
+  if (v === 'accounts') loadExpiry();
   if (v === 'taskscenter') reattachQueueView();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -359,6 +368,10 @@ function renderAccounts(list) {
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
     let cls = '', tag;
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+    else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
+    // 冻结优先于冷却展示：冻结是持续性状态（余额回到阈值以上才自动解除），
+    // 冷却带倒计时——两者同时存在时报冻结更能解释"为什么这个号不参与选号"。
+    else if (s.frozen) { cls = 'cool'; tag = '<span class="tag warn">低积分冻结</span>'; }
     else if (cool > 0) {
       cls = 'cool';
       const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
@@ -380,7 +393,10 @@ function renderAccounts(list) {
       credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
         '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
     }
-    const frozen = s.disabled || cool > 0;
+    // 「解冻」按钮的适用面 = 处于惩罚态的号：禁用 / 低积分冻结 / 冷却中。
+    // pool.Revive 一次清掉这三类（清禁用、冷却、熔断运行态与低积分冻结），
+    // 冷却号显示解冻是原有行为（手工提前恢复），本次只把冻结纳入同一口径。
+    const penalized = s.disabled || s.frozen || cool > 0;
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
@@ -406,11 +422,50 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
-        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
-                : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
+        '<button class="xs ghost" data-a="threshold" data-u="' + esc(s.uid) + '">阈值</button>' +
+        (penalized ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
+                : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
+                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>')) +
+        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
+}
+
+// renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
+// 后端 model_locks 已按「整池不可用 → 没号可用 → 部分限流」排好序，这里只做展示。
+function renderModelLocks(rows) {
+  const tb = $('mlBody');
+  if (!tb) return;
+  const note = $('mlNote');
+  if (!rows || !rows.length) {
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
+    if (note) note.textContent = '';
+    return;
+  }
+  const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
+  const left = iso => {
+    const ms = parseAPITime(iso);
+    return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
+  };
+  tb.innerHTML = rows.map(r => {
+    const st = STATE[r.state] || ['mute', r.state || '—'];
+    const realm = r.realm === 'global' ? '国际版' : '国内版';
+    return '<tr>' +
+      '<td>' + esc(r.model) + '</td>' +
+      '<td><span class="realm-tag">' + realm + '</span></td>' +
+      '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
+      '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
+      '<td class="num">' + (r.locked || 0) + '</td>' +
+      '<td class="num">' + left(r.unlock_at || r.fully_unlock_at) + '</td>' +
+      '<td class="num">' + left(r.fully_unlock_at) + '</td>' +
+      '<td>' + (r.reason ? '<div class="note">' + esc(r.reason) + '</div>' : '—') + '</td>' +
+      '</tr>';
+  }).join('');
+  if (note) {
+    const bad = rows.filter(r => r.state === 'locked' || r.state === 'starved').length;
+    note.textContent = bad ? bad + ' 个模型整池不可用' : rows.length + ' 个模型部分限流';
+  }
 }
 
 async function loadOverview(quiet) {
@@ -420,6 +475,8 @@ async function loadOverview(quiet) {
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
+    // 低积分冻结单列（与「冷却中」互斥）：冻结无倒计时，与冷却不是同一类运维处置。
+    $('sFrozen').textContent = d.frozen || 0;
     $('sDisabled').textContent = d.disabled;
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
@@ -435,6 +492,7 @@ async function loadOverview(quiet) {
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
+    renderModelLocks(d.model_locks);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
@@ -443,7 +501,7 @@ $('accBody').addEventListener('click', async ev => {
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
-  if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
+  if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
   b.disabled = true;
   try {
     if (a === 'checkin') {
@@ -454,12 +512,43 @@ $('accBody').addEventListener('click', async ev => {
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
-      toast('已解冻', 'ok');
+      // Revive 按设计不清阈值：余额仍低于阈值的号会在下一次余额刷新（周期任务默认
+      // 每 5 分钟）被自动重新冻结。按行数据（revive 前的 overviewData）补一句解释，
+      // 避免运维误以为「解冻按钮点了没用/自己回退」——界面必须给出原因。
+      const row = ((overviewData && overviewData.accounts) || []).find(x => x.uid === u);
+      if (row && row.frozen && (row.credits || 0) < (row.freeze_threshold || 0)) {
+        toast('已解冻（余额 ' + (row.credits || 0) + ' 仍低于阈值 ' + row.freeze_threshold + '，下次余额刷新将重新冻结）', 'ok');
+      } else {
+        toast('已解冻', 'ok');
+      }
     } else if (a === 'disable') {
       await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
       toast('已禁用', 'ok');
+    } else if (a === 'pause') {
+      await api('accounts/' + encodeURIComponent(u) + '/pause', { method: 'POST' });
+      toast('已暂停选号（签到 / 保活照常）', 'ok');
+    } else if (a === 'resume') {
+      await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
+      toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
+    } else if (a === 'threshold') {
+      // 阈值预填当前值：从行数据（overviewData.accounts 就是本表渲染源）取，
+      // 不用 DOM 存值——列表每次操作后整体重渲染，两者不会不同步。
+      const row = ((overviewData && overviewData.accounts) || []).find(x => x.uid === u);
+      const current = (row && row.freeze_threshold) || 0;
+      const input = prompt('设置低积分冻结阈值（0 = 关闭）', current);
+      if (input === null) return; // 用户取消
+      const threshold = parseInt(input, 10);
+      if (isNaN(threshold) || threshold < 0) {
+        toast('请输入有效的非负整数', 'err');
+        return;
+      }
+      await api('accounts/' + encodeURIComponent(u) + '/freeze_threshold', {
+        method: 'POST',
+        body: JSON.stringify({ threshold: threshold })
+      });
+      toast('阈值已设置为 ' + threshold, 'ok');
     } else if (a === 'remove') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
@@ -631,9 +720,18 @@ function mdRowHtml(m, pr) {
   if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
   if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
+  // 当前不可用：池内全体账号都撞过 11102（模型级"该后端无此模型"，与账号无关）。
+  // 由后端 pool.ModelAvailabilityAll 标记，与 /v1/models 的剔除同一判据——客户端
+  // 看不到它，运维在面板能看到并知道为什么。徽标进 caps 之上，单列一行更醒目。
+  const unavail = m.unavailable === true;
+  if (unavail) caps.unshift('<span class="tag bad">当前不可用</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
-  const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  const tip = (m.description ? esc(m.description) : '') +
+    (unavail ? (m.description ? '\n' : '') + '池内全部账号实测该模型不可用（11102 该后端无此模型）；换号无效，需上游开通权益。' : '');
+  const tipAttr = tip ? ' title="' + tip + '"' : '';
+  // 不可用行降饱和：一眼扫过去能区分"能用/不能用"，但不隐藏（面板保留可见性）。
+  const rowCls = unavail ? ' class="md-unavail"' : '';
+  return '<tr' + rowCls + '><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tipAttr + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
     '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
@@ -650,9 +748,13 @@ function renderModels() {
     tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m.id))).join('');
   }
   const filtered = list.length !== mdAll.length;
+  // 不可用计数单列：修复三路 UA 并集后目录 19→48，其中十来个是池内全号都 11102 的。
+  // 运维需要一眼知道"这 48 个里几个现在真能用"，否则看到长列表会以为都能选。
+  const unavail = mdAll.filter(m => m.unavailable === true).length;
+  const unavailNote = unavail ? ' · ' + unavail + ' 个当前不可用' : '';
   $('mdCount').textContent = !mdAll.length ? ''
-    : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
-    : mdAll.length + ' 个模型';
+    : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型' + unavailNote
+    : mdAll.length + ' 个模型' + unavailNote;
   $('mdCount').className = filtered ? 'note src-off' : 'note';
 }
 
@@ -885,6 +987,7 @@ const CFG_MAP = {
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
+  include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
@@ -903,6 +1006,19 @@ const CFG_MAP = {
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
 };
+/* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
+ *
+ * 其余文本字段保持「空 = 不下发」的既有语义——那是防误清空的保护，不是 bug：
+ * 表单里某个框没填，通常意味着"没改"，把它当成"请清空"会静默抹掉配置。
+ *
+ * 但覆盖型字段正好相反：清空 = 明确要求回到默认。漏发它们会让面板显示"已保存"
+ * 而值其实没变（issue #102 附带发现 2：user_agent 清空后 config.json 里仍是旧值）。
+ *
+ * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
+ * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
+ */
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
   let o = obj;
@@ -938,7 +1054,8 @@ function collectConfig() {
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
     else {
       const raw = el.value.trim();
-      if (raw === '') v = undefined;
+      // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
+      if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }
@@ -2024,8 +2141,13 @@ function renderUsageChart(series) {
     if (t === null) continue;
     const pt = Number(p.prompt_tokens || 0);
     const ct = Number(p.completion_tokens || 0);
+    // 积分：本桶「与积分同时观测到的 Token」样本数 crs 是**有没有观测到**的判据
+    // （issue #58）。crs=0 表示这段没观测到积分（升级前的历史、或上游没回
+    // usage.credit），此时不能画成"扣了 0 分"——曲线在那里断开。
     pts.push({ t, scope: p.scope, raw: p.t, pt, ct, tt: Number(p.total_tokens || 0) || (pt + ct),
-               req: p.requests || 0 });
+               req: p.requests || 0,
+               cr: Number(p.credits || 0), crs: Number(p.credit_samples || 0),
+               crt: Number(p.credit_tokens || 0) });
   }
   if (!pts.length) {
     host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
@@ -2033,8 +2155,16 @@ function renderUsageChart(series) {
     return;
   }
 
-  const W = 1200, H = 200, PL = 58, PR = 14, PT = 18, PB = 30;
+  // 有积分观测就启用右侧第二条 y 轴（单位是积分，与 token 不同量纲，不能堆叠）。
+  // 右侧留 52px 给积分刻度与「积分」轴名。
+  const hasCr = pts.some(p => p.crs > 0);
+  const W = 1200, H = 200, PL = 58, PR = hasCr ? 52 : 14, PT = 18, PB = 30;
   const iw = W - PL - PR, ih = H - PT - PB;
+  const maxCr = hasCr ? Math.max(0, ...pts.filter(p => p.crs > 0).map(p => p.cr)) : 0;
+  // crScale 只用于定标：maxCr==0（全部观测都是"明确 0 分"）时不能让除法变成
+  // NaN/Inf，也不能因为 maxCr>0 这个附加条件把整条积分轴隐藏掉——"观测到 0 分"
+  // 与"没有观测"是两件事，前者必须看得见（圆点落在基线上）。
+  const crScale = maxCr > 0 ? maxCr : 1;
 
   const t0 = pts[0].t;
   const t1 = pts[pts.length - 1].t;
@@ -2043,9 +2173,11 @@ function renderUsageChart(series) {
   const max = Math.max(1, ...pts.map(p => p.tt));
   const peak = pts.reduce((a, b) => (b.tt > a.tt ? b : a), pts[0]);
   const avg = pts.reduce((s, p) => s + p.tt, 0) / pts.length;
+  const crTot = pts.reduce((s, p) => s + p.cr, 0);
   $('usChartNote').textContent =
     pts.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' + fmtTokTimeLabel(peak) +
-    ' · 均值 ' + fmtTok(avg);
+    ' · 均值 ' + fmtTok(avg) +
+    (hasCr ? ' · 扣除积分 ' + fmtCredit(crTot) + '（橙线，右轴）' : '');
 
   // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
   // 变细，但不会细到看不见。
@@ -2084,6 +2216,25 @@ function renderUsageChart(series) {
            '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
   }
 
+  // 右轴：积分刻度（与左轴 token 同高但独立量纲）。刻度值用整数，避免出现
+  // "0.3 分"这种读不出意义的标注；轴名放最上方，用户一眼知道橙线是什么。
+  const yCr = v => PT + ih - ih * (v / crScale);
+  if (hasCr) {
+    if (maxCr > 0) {
+      for (let i = 0; i <= 4; i++) {
+        const y = PT + ih - (ih * i / 4);
+        out += '<text class="tk" x="' + (W - PR + 6) + '" y="' + (y + 3.5).toFixed(1) +
+               '" text-anchor="start">' + fmtCredit(maxCr * i / 4) + '</text>';
+      }
+    } else {
+      // 全部观测都是 0 分：只标基线，不伪造刻度。
+      out += '<text class="tk" x="' + (W - PR + 6) + '" y="' + (PT + ih + 3.5).toFixed(1) +
+             '" text-anchor="start">0</text>';
+    }
+    out += '<text class="tk-avg" x="' + (W - PR + 6) + '" y="' + (PT - 6) +
+           '" text-anchor="start">积分</text>';
+  }
+
   // 均值参考线：一眼看出"这根是不是异常高"，比只给刻度省心。
   // 标签放左侧：右侧常被峰值柱占用（峰值柱往往就是最后一根），贴左不会被压住。
   if (avg > 0 && avg < max) {
@@ -2111,7 +2262,37 @@ function renderUsageChart(series) {
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
       '" fill="url(#usGradC)" rx="1.5"/>';
     out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
-           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+           fmtTok(p.ct) + ' completion / ' + p.req + ' 次' +
+           (p.crs > 0 ? ' / 扣除 ' + fmtCredit(p.cr) + ' 积分' : ' / 无积分观测') +
+           '</title>';
+  }
+
+  // 积分折线（橙，右轴）。**只连有观测的相邻点**：crs=0 的桶不参与折线，
+  // 于是序列在那里自然断开——这正是"这段没数据"与"这段扣了 0 分"的区分
+  // （issue #58 的核心诉求：看得清每小时扣多少，而不是一个累计总数）。
+  // 单点观测画圆点：折线需要两点才能画，而只有一个有积分的小时也该被看见。
+  if (hasCr) {
+    const segs = [];
+    let cur = [];
+    for (const p of pts) {
+      if (p.crs > 0) { cur.push(p); } else if (cur.length) { segs.push(cur); cur = []; }
+    }
+    if (cur.length) segs.push(cur);
+    for (const seg of segs) {
+      if (seg.length >= 2) {
+        out += '<polyline fill="none" stroke="var(--warn)" stroke-width="1.6" ' +
+               'stroke-linejoin="round" stroke-linecap="round" points="' +
+               seg.map(p => xOf(p.t).toFixed(2) + ',' + yCr(p.cr).toFixed(2)).join(' ') + '"/>';
+      }
+    }
+    // 观测点圆点：太小看不清，太大压住柱子，2.6 是折线宽 1.6 的视觉平衡点。
+    for (const p of pts) {
+      if (p.crs <= 0) continue;
+      out += '<circle cx="' + xOf(p.t).toFixed(2) + '" cy="' + yCr(p.cr).toFixed(2) +
+             '" r="2.6" fill="var(--warn)"><title>' + esc(p.raw) + '  扣除 ' +
+             fmtCredit(p.cr) + ' 积分 / ' + fmtTok(p.crt) + ' tok / ' + p.crs +
+             ' 个样本</title></circle>';
+    }
   }
 
   // 峰值标注：柱子够窄时文字压在柱顶，够宽时贴右侧避免和柱体重叠。
@@ -2283,13 +2464,21 @@ function pkExpiryMs(p) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-// pkDetailGroups 只服务单账号逐包明细：正余额包先按到期时间挑选默认展示项，
-// 其余正余额包与已用完包分别折叠；同一到期时间按面额降序。
+// pkDetailCompare 只服务单账号逐包明细：正余额包先按到期时间挑选默认展示项，
+// 其余正余额包与已用完包分别折叠；同一到期时间按面额降序。主键跟随视图排序
+// 模式（pkSortMode，声明在本区块末尾的绑定块）：end_asc 到期升序、size_desc
+// 面额降序（同面额按到期升序）。typeof 守卫：前端 harness 的区域切片求值里
+// 没有该全局，回落 end_asc（= 上游原有语义，切片测试的期望序不受影响）。
 function pkDetailCompare(a, b) {
   const sizeOf = p => {
     const n = Number(p && p.size);
     return Number.isFinite(n) ? n : 0;
   };
+  const mode = (typeof pkSortMode === 'string' && pkSortMode) || 'end_asc';
+  if (mode === 'size_desc') {
+    const d = sizeOf(b) - sizeOf(a);
+    if (d !== 0) return d;
+  }
   const ea = pkExpiryMs(a), eb = pkExpiryMs(b);
   if (ea == null && eb != null) return 1;
   if (ea != null && eb == null) return -1;
@@ -2510,7 +2699,7 @@ function renderPackages(d, detailLimit) {
 
   $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
 
-  // 逐包明细：每个账号一个表，包的**面额**列是重点
+  // 逐包明细：每个账号一个表，排序规则由视图顶部的选择器决定（默认到期近的在前）
   $('pkDetail').innerHTML = list.map(a => {
     if (a.error) return '';
     const groups = pkDetailGroups(a.packages || [], detailLimit);
@@ -2552,7 +2741,8 @@ function renderPackages(d, detailLimit) {
       '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
       ' / 总额 ' + fmtTok(a.size) + ' · 可用 ' + (groups.visible.length + groups.rest.length) + ' 个包' +
       (groups.used.length ? ' / 已用完 ' + groups.used.length + ' 个' : '') +
-      ' · 默认展示最早到期 ' + pkDetailLimitValue(detailLimit) + ' 条</span>' +
+      ' · 默认展示最早到期 ' + pkDetailLimitValue(detailLimit) + ' 条（' +
+      esc(PK_SORT_LABELS[pkSortMode] || '') + '）</span>' +
       '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
       '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
       '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
@@ -2585,6 +2775,36 @@ if ($('pkDetail')) $('pkDetail').addEventListener('click', ev => {
   }
 });
 
+/* ── 逐包明细排序模式 ─────────────────────────────────────────────── */
+/* 逐包明细的排序规则（选择持久化在 localStorage，跨会话记住）：
+   end_asc   到期升序（默认）——快过期的包排最前，提醒优先消耗；无到期时间的
+             包（上游没下发 end_time）没有可比的日期，统一垫底，不掺进日期序里；
+   size_desc 面额降序——原来的展示口径，看「钱从哪来」。
+   行序统一由 pkDetailCompare 实现（明细折叠分组共用同一比较器，切换模式时
+   折叠组内行序同步跟随）。本块整体放在 renderPackages / renderExpiryDistribution
+   之后：前端 harness 按区域切片求值（[PK_ACCOUNT_COLORS, renderExpiryDistribution)
+   与 [PK_DEFAULT_DETAIL_LIMIT, renderPackages)），顶层 localStorage/$ 语句落进
+   切片区会让无 DOM 桩的求值环境 ReferenceError——上游测试的切片边界不动。 */
+const LS_PK_SORT = 'pkSortMode';
+let pkSortMode = localStorage.getItem(LS_PK_SORT) || 'end_asc';
+const PK_SORT_LABELS = { end_asc: '按到期升序 · 近的在前', size_desc: '按面额降序' };
+// 排序切换时重排明细需要 detailLimit（上游折叠配置），loadPackages 拉到后缓存。
+let lastDetailLimit = PK_DEFAULT_DETAIL_LIMIT;
+
+// 排序规则控件：恢复上次选择并绑定切换。
+if ($('pkSort')) {
+  $('pkSort').value = pkSortMode;
+  if ($('pkSort').value !== pkSortMode) {        // localStorage 里存了废弃值：回落默认
+    pkSortMode = 'end_asc';
+    localStorage.setItem(LS_PK_SORT, pkSortMode);   // 不用 removeItem：harness 桩无此方法
+  }
+  $('pkSort').onchange = () => {
+    pkSortMode = $('pkSort').value;
+    localStorage.setItem(LS_PK_SORT, pkSortMode);
+    if (lastPackages) renderPackages(lastPackages, lastDetailLimit);   // 数据在内存，直接重排
+  };
+}
+
 async function loadPackages() {
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
   $('pkDetail').innerHTML = '';
@@ -2594,11 +2814,107 @@ async function loadPackages() {
       api('packages'),
       api('config').catch(() => null),
     ]);
-    renderPackages(d, pkDetailLimit(c && c.config));
+    lastPackages = d;                            // 缓存供首页到期卡片与排序切换复用
+    lastPackagesAt = Date.now();
+    lastDetailLimit = pkDetailLimit(c && c.config);
+    renderPackages(d, lastDetailLimit);
   } catch (e) {
     $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
     $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(e.message) + '</div>';
   }
 }
+
+/* ── 积分到期提醒（首页卡片）────────────────────────────────────────── */
+/* 积分不是永久的：签到/任务发的裂变包约一个月失效。只看「剩余积分 ÷ 日消耗」
+   会系统性偏乐观——用不完的部分到期直接蒸发。这里把「最近要过期的是哪批、
+   有多少、到期前每天要至少消耗多少」顶到首页，数据源与「积分构成」共用
+   （lastPackages 缓存，EXP_FRESH_MS 内复用，不重复打上游）。 */
+
+// expBatches 把某账号的包聚合成「到期日 → 该日作废积分」升序列表。
+// 只统计 remain>0 且有到期时间的包——没余额/长期包到期没有任何影响。
+function expBatches(packs) {
+  const byDay = new Map();
+  for (const p of packs || []) {
+    const r = Number(p.remain || 0);
+    const t = (p.end_time || '').slice(0, 10);
+    if (r <= 0 || !t) continue;
+    byDay.set(t, (byDay.get(t) || 0) + r);
+  }
+  return [...byDay.entries()]
+    .map(([date, remain]) => ({ date, remain }))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+}
+
+function expDaysLeft(dateStr, today) {
+  return Math.round((new Date(dateStr + 'T00:00:00') - today) / 86400000);
+}
+
+function renderExpiry(d) {
+  const list = (d.accounts || []);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const rows = list.map(a => {
+    if (a.error) {
+      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
+        '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+        '<span class="exp-main err">查询失败：' + esc(a.error) + '</span></div>';
+    }
+    const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
+    if (!bs.length) {
+      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
+        '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+        '<span class="exp-main">7 天内无到期积分</span></div>';
+    }
+    const first = bs[0];
+    const days = expDaysLeft(first.date, today);
+    const daily = Math.ceil(first.remain / Math.max(1, days));
+    const week = bs.filter(b => expDaysLeft(b.date, today) <= 7)
+      .reduce((s, b) => s + b.remain, 0);
+    // 危险度：≤3 天红（不抓紧就真没了）、≤7 天琥珀、更远绿。
+    // 上游扣包是 FEFO（按失效时刻升序，实测两号口径一致）：这些快过期批次正是
+    // 被消耗得最快的，日均需耗给的是「哪怕单靠这个账号的自然流量也能对齐」的参照。
+    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
+    const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
+    const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
+    const rest = bs.slice(1, 4).map(b =>
+      '随后 ' + esc(b.date.slice(5)) + ' · ' + fmtTok(b.remain)).join('　') + more;
+    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
+      '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+      '<span class="exp-main">最近到期 <b>' + esc(first.date) + '</b>（' + dayWord +
+      '）· 该批 <b>' + fmtTok(first.remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
+      fmtTok(daily) + '</b>' +
+      (week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : '') +
+      (rest ? '<div class="note">' + rest + '</div>' : '') +
+      '</span></div>';
+  }).join('');
+  $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
+  // 数据新鲜度透明化：走缓存时标注年龄，免得把旧数据误当实时。
+  const ageMin = lastPackages ? Math.floor((Date.now() - lastPackagesAt) / 60000) : 0;
+  $('expNote').textContent = (lastPackagesAt && ageMin > 0)
+    ? list.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，可点「检查」刷新'
+    : list.length + ' 个账号 · 实时查询上游';
+  $('expBox').hidden = false;
+}
+
+async function loadExpiry(force) {
+  if (!$('expBox')) return;
+  if (expFetching) return;
+  const fresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
+  if (fresh && !force) { renderExpiry(lastPackages); return; }
+  expFetching = true;
+  $('expBox').hidden = false;
+  if (!$('expList').children.length) $('expList').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
+  $('expNote').textContent = '查询中…';
+  try {
+    const d = await api('packages');
+    lastPackages = d;                            // 与「积分构成」视图共用同一份缓存
+    lastPackagesAt = Date.now();
+    renderExpiry(d);
+  } catch (e) {
+    $('expNote').textContent = '查询失败：' + esc(e.message);
+  }
+  expFetching = false;
+}
+
+if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
 if ($('btnPk')) $('btnPk').onclick = loadPackages;

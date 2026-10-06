@@ -128,9 +128,12 @@ func TestUserAgentOverrideBilling(t *testing.T) {
 	}
 }
 
-// TestFetchModelsUsesConfiguredUA FetchModels 手工 Set UA 也走覆盖。
+// TestFetchModelsUsesConfiguredUA FetchModels 里企业端点走配置的 UA 覆盖；
+// /v3/config 的**目录探测**则固定走官方 IDE UA 一路（见 fetchV3Models 注释，
+// wb9 回退三路并集）——配置的 user_agent 是"出站身份"，与"探哪路目录"是两件事。
 func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	probed := map[string]bool{}
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			switch {
@@ -139,9 +142,11 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 					t.Errorf("personal/models UA = %q want FetchAgent/2", got)
 				}
 			case strings.HasSuffix(r.URL.Path, "/v3/config"):
-				if got := r.Header.Get("User-Agent"); got != codeBuddyIDEUA {
-					t.Errorf("v3/config UA = %q want %s", got, codeBuddyIDEUA)
+				ua := r.Header.Get("User-Agent")
+				if ua != codeBuddyIDEUA {
+					t.Errorf("v3/config UA = %q want codeBuddyIDEUA (%q)", ua, codeBuddyIDEUA)
 				}
+				probed[ua] = true
 				return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 			default:
 				t.Errorf("path=%s", r.URL.Path)
@@ -154,6 +159,9 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 	}
 	if _, err := c.FetchModels(a); err != nil {
 		t.Errorf("fetchModels: %v", err)
+	}
+	if len(probed) != 1 || !probed[codeBuddyIDEUA] {
+		t.Errorf("should probe exactly the IDE UA family, got %v", probed)
 	}
 }
 

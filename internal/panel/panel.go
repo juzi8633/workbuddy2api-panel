@@ -1,6 +1,6 @@
 // Package panel 内嵌式 Web 管理面板：账号池总览、单号运维（解冻/禁用/签到/
-// 刷新余额/移除）、浏览器内 OAuth 添加账号（免重启热加载进池）、手动批量
-// 签到/保活，以及运行日志环形缓冲（镜像 log 包与 chat 表格日志）。
+// 刷新余额/移除/低积分自动冻结阈值）、浏览器内 OAuth 添加账号（免重启热加载进池）、
+// 手动批量签到/保活，以及运行日志环形缓冲（镜像 log 包与 chat 表格日志）。
 //
 // 设计约束：
 //   - 前端 go:embed 单文件（index.html），无任何外部构建依赖，与二进制同体部署；
@@ -40,6 +40,15 @@ type Config struct {
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
 	RedisMode string               // "upstash" / "noop"，仅观测透出
 	Version   string               // 面板版本号（展示用）
+	// Build 构建标识（形如 "wb2026.10.04+7d7b4c9c"）：日期 + 二进制自身 sha256 前 8 位。
+	//
+	// 与 Version 的分工：
+	//   - Version 是**批次身份**（"1.11.11-wb8"），用于展示与静态资源 cache-busting。
+	//     每批一变，但同一批内所有构建共享同一值。
+	//   - Build 是**产物指纹**，用于核对"这台机上跑的到底是哪个二进制"。
+	//     由 main 自读 /proc/self/exe 算出，不依赖任何构建参数 —— 因此永不与
+	//     实际二进制漂移（ldflags 注入要靠人记得传，自哈希不会忘）。
+	Build string
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -151,6 +160,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
@@ -160,6 +171,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/freeze_threshold", p.withAuth(p.accountSetFreezeThreshold))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
@@ -186,10 +198,17 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
 
-// ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
-// 与 401 错误响应全都带上（API 也可能在浏览器里被直接打开）。
+// ServeHTTP 统一入口：先写安全响应头与禁缓存头再分发，保证页面、静态资源、
+// API、401 / 404 等全部响应都带上（API 也可能在浏览器里被直接打开）。
+//
+// 为什么禁缓存统一在这里做：面板所有响应都是实时数据（余额 / 用量 / 积分 /
+// 模型目录）或与版本绑定的静态资源，URL 固定且无 ETag/Last-Modified。不设
+// Cache-Control 时浏览器按启发式规则自行缓存，表现为「已清理的条目仍在显示 /
+// 发版后仍用旧 app.js」。放这里可一次覆盖全部出口，包括 mux 自产的 404 —— 那些
+// 响应不经过 writeJSON，只在 writeJSON 里加会漏。
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
+	w.Header().Set("Cache-Control", "no-store")
 	p.mux.ServeHTTP(w, r)
 }
 
@@ -228,13 +247,14 @@ func (p *Panel) expiringSoonWindow() time.Duration {
 
 // overview 总览：池计数 + 每账号状态 + 面板元信息。
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
-	total, healthy, cooling, disabled, inFlightFull := p.cfg.Pool.CountsDetailed()
+	total, healthy, cooling, frozen, disabled, inFlightFull := p.cfg.Pool.CountsDetailed()
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
+		"build":           p.cfg.Build,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
 		"auth_required":   p.apiKey() != "",
 		"redis_mode":      p.cfg.RedisMode,
@@ -242,9 +262,15 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"total":           total,
 		"healthy":         healthy,
 		"cooling":         cooling,
-		"disabled":        disabled,
-		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		// frozen 低积分冻结单列（与 cooling 互斥）：面板「低积分冻结」卡片数据源，
+		// 运维一眼看到冻结规模，不必逐行看标签。
+		"frozen":         frozen,
+		"disabled":       disabled,
+		"in_flight_full": inFlightFull,
+		"accounts":       p.cfg.Pool.List(),
+		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
+		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
+		"model_locks": p.cfg.Pool.ModelLockView(),
 	})
 }
 
@@ -314,14 +340,24 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 
 	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
 	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
+	//
+	// 池内全体账号都不可用的模型（11102 负缓存覆盖全池）在这里**标记**而不是剔除：
+	// /v1/models 剔除它们（客户端模型发现不该选中必然失败的名字），面板则要保留
+	// 可见性并打上标记——运维需要在面板里看到"这个模型当前用不了"，剔除掉反而
+	// 无从判断是上游没这个模型还是权益不足。
 	if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
 		if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
 			infos, err := p.cfg.Upstream.FetchModels(acct)
 			if err != nil {
 				fetchErrs = append(fetchErrs, "cn: "+err.Error())
 			} else {
+				unavailable := p.unavailableModels()
 				for _, mi := range infos {
-					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
+					entry := panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP)
+					if unavailable[mi.ID] {
+						entry["unavailable"] = true
+					}
+					out = append(out, entry)
 				}
 			}
 		}
@@ -354,6 +390,36 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// unavailableModels 返回「池内全不可用」的 CN 模型集合（面板标记用）。
+//
+// 判据与 /v1/models 的剔除**必须逐字一致**（同三个条件：过半数 11102 实证 +
+// 无账号成功过 + 当前选不到），否则会出现"客户端看不到但面板也不标记"或反过来的
+// 漂移。两处各自实现会漂移，所以这里调同一个 Pool 证据接口、用同一个阈值表达式。
+//
+// 与 server 侧 unavailableModelIDs 的关系：那是 Handler 的方法（internal/server），
+// 面板不 import server 包（方向相反）。重复的只有 5 行阈值判断，且两处都有测试
+// 断言同一场景，漂移会被测试抓住。
+func (p *Panel) unavailableModels() map[string]bool {
+	if p.cfg.Pool == nil {
+		return nil
+	}
+	ev := p.cfg.Pool.ModelUnavailableEvidenceAll("cn")
+	out := make(map[string]bool)
+	for model, e := range ev {
+		if e.Total == 0 {
+			continue
+		}
+		if e.Blocked*2 < e.Total { // 过半数实证不可用
+			continue
+		}
+		if e.Healthy > 0 { // 有账号成功用过 → 不标记（否决项）
+			continue
+		}
+		out[model] = true
+	}
+	return out
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
@@ -471,6 +537,68 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cfg.Pool.Disable(uid, "manual disable (panel)")
 	log.Printf("panel: disable uid=%s（人工禁用）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountSetFreezeThreshold 设置单号低积分自动冻结阈值（0 = 关闭）：
+// 余额低于阈值时账号自动冻结、退出选号；余额恢复到阈值以上自动解冻。
+// 冻结与禁用正交（禁用号设阈值只改冻结域，不改变禁用终态）。
+func (p *Panel) accountSetFreezeThreshold(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if _, ok := p.cfg.Pool.Status(uid); !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	// 指针类型区分「字段缺失」与「显式 0」：body 无 threshold（`{}` / 拼错键名）时
+	// 旧实现解出零值直接走「关闭」分支，静默清掉既有阈值与冻结态还返回 200，
+	// 调用方无法区分「显式关阈值」与「字段缺失/写错」——缺失一律 400。
+	var body struct {
+		Threshold *int64 `json:"threshold"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	if body.Threshold == nil {
+		writeErr(w, http.StatusBadRequest, "threshold required")
+		return
+	}
+	threshold := *body.Threshold
+	if threshold < 0 {
+		writeErr(w, http.StatusBadRequest, "threshold must be >= 0")
+		return
+	}
+	p.cfg.Pool.SetFreezeThreshold(uid, threshold)
+	// 回读冻结结果（阈值可高于当前余额 → 本次调用即冻结）。
+	frozen := false
+	if st, ok := p.cfg.Pool.Status(uid); ok {
+		frozen = st.Frozen
+	}
+	log.Printf("panel: freeze_threshold uid=%s threshold=%d frozen=%v", uid, threshold, frozen)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "threshold": threshold, "frozen": frozen})
+}
+
+// accountPause 暂停选号：账号退出选号候选，但**照常参与**签到 / 活跃上报 / 保活 /
+// 余额刷新。与 disable 的区别：不写 reason、不清冷却域、不重置计数——账号是「临时
+// 让位」而非「判死」，点「恢复选号」即可立刻回到池子（无需重登或解冻）。
+func (p *Panel) accountPause(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !p.cfg.Pool.Pause(uid) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: pause uid=%s（暂停选号，保号任务照常）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountResume 解除暂停选号（幂等，对未暂停账号为空操作）。
+func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !p.cfg.Pool.Resume(uid) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: resume uid=%s（恢复参与选号）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -639,11 +767,11 @@ func (p *Panel) syncNicknames() {
 		return
 	}
 	var (
-		mu       sync.Mutex
-		updated  int
-		failed   int
-		sem      = make(chan struct{}, 3)
-		wg       sync.WaitGroup
+		mu      sync.Mutex
+		updated int
+		failed  int
+		sem     = make(chan struct{}, 3)
+		wg      sync.WaitGroup
 	)
 	for _, j := range jobs {
 		wg.Add(1)
@@ -804,6 +932,8 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
 }
 
+// writeJSON 输出 JSON 响应。禁缓存由 ServeHTTP 统一设置（见那里的说明），
+// 此处只管内容类型 —— 401/404 等非 writeJSON 出口也要覆盖，放一处才不会漏。
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json")

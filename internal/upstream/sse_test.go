@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -930,5 +931,148 @@ func TestStreamHintErrorFrameObserver(t *testing.T) {
 	}
 	if normalObserved != 0 {
 		t.Fatalf("正常流触发了观察者 %d 次，want 0", normalObserved)
+	}
+}
+
+// TestPackageExpiryPrefersDeductionEndTime 到期判据必须优先 DeductionEndTime
+// （可抵扣窗口结束），回落 CycleEndTime（周期边界）——issue #23 的根因就是
+// 路由路径只读后者：上游实测两者不等，把「周期重置点」当到期时刻会把快到期的
+// 包误判成晚到期，于是临期优先路由永远不生效（issue #23/#101）。
+func TestPackageExpiryPrefersDeductionEndTime(t *testing.T) {
+	// 同一包的两种字段：周期边界早于真失效时刻（实测形态）。
+	cycle := time.Date(2026, 10, 31, 23, 59, 0, 0, softRateResetLoc)
+	ded := time.Date(2026, 11, 2, 22, 35, 0, 0, softRateResetLoc)
+
+	got, ok := packageExpiry(ded.UnixMilli(), cycle.Format(packageEndLayout))
+	if !ok {
+		t.Fatal("packageExpiry must resolve when DeductionEndTime is present")
+	}
+	if !got.Equal(ded) {
+		t.Errorf("got %v want DeductionEndTime %v (CycleEndTime must not win)", got, ded)
+	}
+
+	// DeductionEndTime 缺失（0）→ 回落 CycleEndTime。
+	got, ok = packageExpiry(0, cycle.Format(packageEndLayout))
+	if !ok || !got.Equal(cycle) {
+		t.Errorf("fallback got %v/%v want %v/true", got, ok, cycle)
+	}
+
+	// 负值同样视为缺失（脏数据不该被当成 1969 年的时间戳）。
+	if got, ok = packageExpiry(-1, cycle.Format(packageEndLayout)); !ok || !got.Equal(cycle) {
+		t.Errorf("negative DeductionEndTime must fall back: got %v/%v", got, ok)
+	}
+
+	// 两者都拿不到 → false（保守不计入到期路由，宁可漏标不可错标）。
+	if _, ok = packageExpiry(0, ""); ok {
+		t.Error("no field at all must return ok=false")
+	}
+	if _, ok = packageExpiry(0, "not-a-time"); ok {
+		t.Error("unparsable CycleEndTime must return ok=false")
+	}
+}
+
+// TestUserResourceDetailedUsesDeductionEndTime 路由路径的端到端回归：上游只下发
+// DeductionEndTime（无 CycleEndTime）时，earliest/expiring 必须能算出来。
+// 修复前该形态恒 miss —— 正是「上游字段全集无 PackageEndTime 且本路径不读
+// DeductionEndTime」导致的 expiring 恒 0（issue #23）。
+func TestUserResourceDetailedUsesDeductionEndTime(t *testing.T) {
+	now := time.Now()
+	soon := now.Add(24 * time.Hour)
+	later := now.Add(10 * 24 * time.Hour)
+	payload := `{"code":0,"data":{"Response":{"Data":{"Accounts":[` +
+		`{"PackageName":"soon","CycleCapacitySize":10,"CycleCapacityRemain":10,"CycleCapacityUsed":0,"DeductionEndTime":` + strconv.FormatInt(soon.UnixMilli(), 10) + `},` +
+		`{"PackageName":"later","CycleCapacitySize":20,"CycleCapacityRemain":20,"CycleCapacityUsed":0,"DeductionEndTime":` + strconv.FormatInt(later.UnixMilli(), 10) + `}` +
+		`]}}}}`
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		return jsonResp(200, payload), nil
+	})
+
+	remain, total, expiring, earliestAt, earliestRemaining, err := c.UserResourceDetailedWithExpiry(
+		&auth.Auth{AccessToken: "at", UID: "u1"}, 48*time.Hour,
+	)
+	if err != nil {
+		t.Fatalf("resource: %v", err)
+	}
+	if remain != 30 || total != 30 || expiring != 10 {
+		t.Fatalf("remain/total/expiring=%d/%d/%d want 30/30/10 (expiring must see DeductionEndTime)", remain, total, expiring)
+	}
+	// 上游字段是 epoch 毫秒，比较也按毫秒（UnixMilli 截断，直接 Equal 会因纳秒差异失败）。
+	if earliestRemaining != 10 || earliestAt.UnixMilli() != soon.UnixMilli() {
+		t.Fatalf("earliest=%v/%d want %v/10", earliestAt, earliestRemaining, soon)
+	}
+}
+
+// TestFetchV3ModelsProbesIDEFamilyOnly wb9 起 /v3/config 目录探测只走官方 IDE UA
+// 一路（此前 wb6 曾三路并集，见 fetchV3Models 注释与其实测表）。本测试把「只探
+// 一路」钉成契约：既防止桌面端/CLI 的模型重新漏进 /v1/models，也防止有人再去
+// 调 fetchV3ConfigModelMap 的其它 UA。
+func TestFetchV3ModelsProbesIDEFamilyOnly(t *testing.T) {
+	seenUA := map[string]int{}
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/v3/config") {
+			return nil, errors.New("unexpected path: " + r.URL.Path)
+		}
+		ua := r.Header.Get("User-Agent")
+		seenUA[ua]++
+		if ua != codeBuddyIDEUA {
+			t.Errorf("v3/config probed with UA %q, want only codeBuddyIDEUA", ua)
+		}
+		// 该响应故意带上桌面端/CLI 家族的模型 id：它们不得出现在结果里
+		// （真实上游对 IDE UA 不下发这些，这里模拟"假如上游下发了"的防线）。
+		return jsonResp(200, `{"code":0,"data":{"models":[`+
+			`{"id":"common","name":"公共模型","credits":"111","maxOutputTokens":8192},`+
+			`{"id":"ide-only","name":"IDE 专有","credits":"1","maxOutputTokens":8192},`+
+			`{"id":"desktop-only","name":"桌面专有","credits":"2","maxOutputTokens":8192},`+
+			`{"id":"cli-only","name":"CLI 专有","credits":"3","maxOutputTokens":8192}`+
+			`]}}`), nil
+	})
+
+	got, err := c.FetchModels(&auth.Auth{UID: "u1", AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	ids := map[string]ModelInfo{}
+	for _, mi := range got {
+		ids[mi.ID] = mi
+	}
+	for _, want := range []string{"common", "ide-only"} {
+		if _, ok := ids[want]; !ok {
+			t.Errorf("model %q missing; got %d models: %v", want, len(got), ids)
+		}
+	}
+	if len(seenUA) != 1 || seenUA[codeBuddyIDEUA] != 1 {
+		t.Errorf("expected exactly one IDE-UA probe, got %v", seenUA)
+	}
+}
+
+// TestFetchV3ModelsIDEFailureDegradesToEnterprise 单路语义下 IDE /v3/config 失败
+// 不再有其它 UA 家族兜底，只能降级到企业端点（企业端点同时失败才整体报错）。
+func TestFetchV3ModelsIDEFailureDegradesToEnterprise(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/v3/config") {
+			return jsonResp(500, `{"code":500,"msg":"boom"}`), nil
+		}
+		return jsonResp(200, `{"code":0,"data":{"models":[{"id":"ent-only","name":"x",`+
+			`"maxOutputTokens":8192}],"agents":[{"name":"cli","models":["ent-only"]}]}}`), nil
+	})
+	got, err := c.FetchModels(&auth.Auth{UID: "u1", AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("FetchModels should degrade to the enterprise endpoint: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "ent-only" {
+		t.Fatalf("want only the enterprise model, got %v", got)
+	}
+}
+
+// TestFetchV3ModelsAllSourcesFail 两路都失败才返回错误（保持既有失败语义）。
+func TestFetchV3ModelsAllSourcesFail(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(500, `{"code":500,"msg":"boom"}`), nil
+	})
+	if _, err := c.FetchModels(&auth.Auth{UID: "u1", AccessToken: "at"}); err == nil {
+		t.Fatal("FetchModels must fail when both the v3 and enterprise probes fail")
 	}
 }

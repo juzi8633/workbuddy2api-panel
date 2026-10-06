@@ -102,6 +102,15 @@ func TestUpstreamTimeoutDoesNotRotateOrPenalize(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "upstream_timeout") {
 		t.Errorf("末端 code 应为 upstream_timeout，body=%s", rec.Body.String())
 	}
+	// gateway_hint 必须跟着一起区分：默认 hint 是「池中没有可用的健康账号」，
+	// 那会把排查引向账号池，而超时的真实原因在上游侧、且一个账号都没罚。
+	respBody := rec.Body.String()
+	if strings.Contains(respBody, "池中没有可用的健康账号") {
+		t.Errorf("upstream_timeout 的 gateway_hint 不该是 no_healthy_account 文案，body=%s", respBody)
+	}
+	if !strings.Contains(respBody, "gateway_hint") {
+		t.Errorf("upstream_timeout 应带 gateway_hint，body=%s", respBody)
+	}
 	// 两个账号都不得被喂连败/熔断计数。
 	for _, a := range []*auth.Auth{a1, a2} {
 		st, ok := p.Status(a.UID)

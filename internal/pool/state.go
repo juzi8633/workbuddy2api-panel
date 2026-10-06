@@ -70,9 +70,11 @@ func (p *Pool) ReviveDisabled(uid string) {
 	}
 }
 
-// Revive 运维口径的"无条件恢复"：清禁用、冷却（含软退避计数）与熔断运行态。
+// Revive 运维口径的"无条件恢复"：清禁用、冷却（含软退避计数）、熔断运行态与低积分冻结。
 // 与 ReviveDisabled（只清禁用）和 ReenableIfCredits（只清冷却、不动熔断）的区别：
 // 本方法清除全部惩罚状态，供管理面板"解冻"按钮使用——人工判断该号可用时一键恢复。
+// 低积分冻结（frozen）同属惩罚态，一并清除：人工恢复不要求余额先回到阈值以上
+// （阈值仍在，下次余额刷新若仍低于阈值会重新冻结——人工恢复是临时覆盖，不是关阈值）。
 // uid 不存在返回 false（供调用方区分"账号不存在"与"已复活"）。
 func (p *Pool) Revive(uid string) bool {
 	p.mu.Lock()
@@ -82,6 +84,7 @@ func (p *Pool) Revive(uid string) bool {
 		return false
 	}
 	e.disabled = false
+	e.paused = false // 解冻是全清：暂停选号一并解除
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.reason = ""
@@ -91,7 +94,88 @@ func (p *Pool) Revive(uid string) bool {
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
+	p.unfreezeLocked(e) // 清 frozen/frozenReason（冻结阈值保留）
 	p.dirty.Store(true)
+	return true
+}
+
+// SetFreezeThreshold 设置账号的低积分自动冻结阈值（管理面板入口；threshold <= 0 = 关闭）。
+//
+// 语义（全部在 p.mu 持锁下完成，与 credits 的读写天然互斥）：
+//   - threshold <= 0：关闭冻结，清 frozen/frozenReason（不论当前余额多少）；
+//   - threshold > 0 且 credits < threshold：立即冻结（freezeLocked，无需等下一次余额刷新）；
+//   - threshold > 0 且 credits >= threshold 且当前处于冻结态：立即解冻（unfreezeLocked，
+//     阈值调低后即刻恢复，不必等下一次余额刷新）。
+//
+// 阈值本身持久化（stateAccount.FreezeThreshold），重启后继续生效。冻结与禁用正交：
+// 本方法不读写 disabled/reason（已被禁用的号设阈值同样只改冻结域，禁用终态不变）。
+// uid 不存在为空操作（与 SetCredits 同口径）；本方法内部自持 p.mu，调用方不得持锁。
+func (p *Pool) SetFreezeThreshold(uid string, threshold int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	e.freezeThreshold = threshold
+	switch {
+	case threshold <= 0:
+		p.unfreezeLocked(e) // 关闭功能：清残留冻结态
+	case e.credits < threshold:
+		p.freezeLocked(e) // 阈值高于当前余额：立即冻结
+	case e.frozen:
+		p.unfreezeLocked(e) // 阈值不高于当前余额且已冻结：立即解冻
+	}
+	p.dirty.Store(true)
+}
+
+// checkFreezeLocked 低积分自动冻结/解冻的唯一判定点：credits 变更后由各入口调用
+// （ReenableIfCredits / SetCredits / SetCreditsDetailed / NoteModelCost），即"余额刷新
+// 与消费"两个方向的余额变化处——冻结与自动解冻都紧跟权威余额更新，不依赖额外定时器。
+// 新增 credits 写入口时必须一并调用本方法，否则会写出 frozen 与（阈值, 余额）不自洽的
+// state.json（SetCredits 曾漏调，面板单号「余额」刷新不解冻，见 persist.go 恢复侧对账）。
+//
+// 两个方向：
+//   - 阈值开启（>0）且 credits < threshold 且未冻结 → freezeLocked（进入冻结）；
+//   - 已冻结且 credits >= threshold → unfreezeLocked（余额恢复 → 自动解冻）。
+//
+// 第二条件未加"阈值 > 0"：阈值被关闭（0）后残留的冻结态不需要等 credits 变更即可
+// 自愈（0 阈值下任何非负余额都满足 >= 0），与 SetFreezeThreshold 的关闭分支互为兜底。
+// 阈值 0 = 关闭：不主动冻结。调用方必须已持有 p.mu。
+func (p *Pool) checkFreezeLocked(e *entry) {
+	if e.freezeThreshold > 0 && e.credits < e.freezeThreshold && !e.frozen {
+		p.freezeLocked(e)
+		return
+	}
+	if e.frozen && e.credits >= e.freezeThreshold {
+		p.unfreezeLocked(e)
+	}
+}
+
+// Pause 暂停选号：账号退出选号候选，但**照常参与**签到 / 活跃上报 / 保活 / 余额刷新。
+// 与 Disable 的区别：不写 reason、不清冷却域、不重置任何计数——账号是「临时让位」
+// 而非「判死」，故无需重登或人工解冻，Resume 即可立刻恢复。
+// uid 不存在返回 false（供调用方区分"账号不存在"与"已暂停"）。
+func (p *Pool) Pause(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.pauseLocked(e)
+	return true
+}
+
+// Resume 解除暂停选号（幂等，对未暂停账号为空操作）。uid 不存在返回 false。
+func (p *Pool) Resume(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.resumeLocked(e)
 	return true
 }
 
@@ -116,6 +200,8 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 		e.creditsExpiring = 0
 		e.creditsEarliestExpiry = time.Time{}
 		e.creditsEarliestRemaining = 0
+		// 权威余额已更新：低积分冻结/自动解冻跟随判定（余额恢复到阈值以上即解冻）。
+		p.checkFreezeLocked(e)
 		p.dirty.Store(true)
 	}
 }
@@ -213,6 +299,8 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 				e.creditsEarliestRemaining -= d
 			}
 		}
+		// 实测扣费压低余额：低积分冻结跟随判定（消费到阈值以下即冻结，无需等签到/刷新）。
+		p.checkFreezeLocked(e)
 	}
 	if e.modelCost == nil {
 		e.modelCost = make(map[string]modelCostEntry)
@@ -399,23 +487,27 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	return e.a
 }
 
-// CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。
-// cooling 含常规冷却（until）与熔断期（breakerUntil）。
-// 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/until/breakerUntil）；
+// CountsDetailed 返回 total/healthy/cooling/frozen/disabled/inFlightFull 六类计数。
+// cooling 含常规冷却（until）、熔断期（breakerUntil）与连败降权（degradeUntil）——
+// **不含低积分冻结**：冻结单列 frozen（无倒计时，与 cooling 的"等一会儿会恢复"
+// 语义不同；此前冻结号被并进 cooling，运维从汇总看不出冻结规模，只能逐行看标签）。
+// 分类互斥且按判定优先级短路：disabled > frozen > cooling > healthy。
+// 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/frozen/until/breakerUntil）；
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
-func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
+func (p *Pool) CountsDetailed() (total, healthy, cooling, frozen, disabled, inFlightFull int) {
 	return p.countsDetailedForRealm("")
 }
 
 // CountsDetailedForRealm 同 CountsDetailed，但仅统计 Realm()==realm 的账号；
 // realm=="" 不加谓词（= CountsDetailed）。供 /status 按域分组透出。
-func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
+func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, frozen, disabled, inFlightFull int) {
 	return p.countsDetailedForRealm(realm)
 }
 
 // countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
-func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
+// 冻结号单列 frozen（不计入 cooling）：冻结没有倒计时，与冷却不是同一类运维处置。
+func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, frozen, disabled, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -425,8 +517,12 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 		}
 		total++
 		switch {
-		case e.disabled:
+		case e.disabled || e.paused:
+			// paused（暂停选号）与 disabled 同样不可选，合并计入 disabled 类
+			//（/status 的「不可用」口径）；细粒度区分由 Status.Paused 透出。
 			disabled++
+		case e.frozen:
+			frozen++ // 低积分冻结：单列计数（不与 cooling 混计）
 		case !e.healthy(now):
 			cooling++
 		default:
@@ -436,7 +532,7 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 			}
 		}
 	}
-	return total, healthy, cooling, disabled, inFlightFull
+	return total, healthy, cooling, frozen, disabled, inFlightFull
 }
 
 // ServableNow 报告池当前是否可服务：存在至少一个 healthy 且未占满在途名额的账号。
@@ -503,8 +599,12 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 		CreditsEarliestRemaining: e.creditsEarliestRemaining,
 		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
+		Paused:                   e.paused,
 		Reason:                   e.reason,
 		Disabled:                 e.disabled,
+		FreezeThreshold:          e.freezeThreshold,
+		Frozen:                   e.frozen,
+		FrozenReason:             e.frozenReason,
 		SuccessCount:             e.successCount,
 		ErrTotal:                 e.errTotal,
 		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
@@ -621,4 +721,151 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 		return nil
 	}
 	return rows
+}
+
+// ModelUnavailableEvidence 某模型的「不可用证据」汇总（供 /v1/models 剔除判定）。
+//
+// 字段语义：
+//   - Blocked  有 11102 负缓存条目的账号数（**实证**该账号跑不了这个模型）。
+//   - Total    能服务该 realm 的账号总数（realm 谓词同 ModelAvailability）。
+//   - Healthy  「有正面证据仍能用」的账号数 —— 即该账号与上游**成功**交互过这个模型
+//     （modelCost 账本有观测，只在成功路径写入且 6h TTL 内）。
+//     这是否决项：只要有一个账号证明能用，模型就不该被剔。
+//   - Available 选号路径当前真能选到的账号数（ModelAvailability 同判据）。
+type ModelUnavailableEvidence struct {
+	Blocked   int
+	Total     int
+	Healthy   int
+	Available int
+	Reason    string // 首个 11102 条目的 reason 原文（面板展示用）
+	Since     time.Time
+}
+
+// ModelUnavailableEvidenceAll 汇总池中**所有**被 11102 负缓存过的模型的证据。
+//
+// 与 ModelAvailabilityAll 的区别：后者只报"当前能选到几个账号"，本函数额外给出
+// 证据面（Blocked/Healthy/Total），供调用方按自己的阈值判"是否池内全不可用"。
+// 判据必须由调用方给，因为阈值是**策略**（见 internal/server 的 unavailableModelIDs
+// 注释：为什么用 Blocked>=过半 而不是 Available==0）。
+func (p *Pool) ModelUnavailableEvidenceAll(realm string) map[string]ModelUnavailableEvidence {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	out := map[string]ModelUnavailableEvidence{}
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		for m, mc := range e.modelCooldowns {
+			if !mc.Until.After(now) || !IsModelUnavailableReason(mc.Reason) {
+				continue
+			}
+			ev := out[m]
+			ev.Reason = mc.Reason
+			ev.Since = mc.Until
+			out[m] = ev
+		}
+	}
+	for m := range out {
+		ev := out[m]
+		for _, e := range p.byUID {
+			if realm != "" && e.a.Realm() != realm {
+				continue
+			}
+			ev.Total++
+			// **正面证据优先**：与上游成功交互过（modelCost 只在成功路径写、
+			// 6h TTL 内有效）。必须先于 11102 判定——生产上成功会让
+			// BlockModelClear 删掉 11102 条目，两者不共存；但若因故共存
+			// （并发/状态文件手改），成功是更强的证据，应当否决剔除。
+			if c, ok := e.modelCost[m]; ok && !c.LastSeen.IsZero() && now.Sub(c.LastSeen) <= modelCostTTL {
+				ev.Healthy++
+				continue
+			}
+			// 11102 实证不可用。
+			if mc, ok := e.modelCooldowns[m]; ok && mc.Until.After(now) && IsModelUnavailableReason(mc.Reason) {
+				ev.Blocked++
+				continue
+			}
+			if p.availableForModelLocked(e, m, now) {
+				ev.Available++
+			}
+		}
+		out[m] = ev
+	}
+	return out
+}
+
+// ModelHasSucceeded 报告池中是否有账号与上游**成功**交互过该模型。
+// 单个模型的快速判定（面板/日志路径用），语义同 ModelUnavailableEvidence.Healthy > 0。
+func (p *Pool) ModelHasSucceeded(model, realm string) bool {
+	if model == "" {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if c, ok := e.modelCost[model]; ok && !c.LastSeen.IsZero() && now.Sub(c.LastSeen) <= modelCostTTL {
+			return true
+		}
+	}
+	return false
+}
+
+// ModelAvailability 报告某模型在池中的可用账号数与总账号数。
+//
+// 语义（供 /v1/models 剔除「池内全体账号都不可用」的模型）：
+//
+//   - total  = 池内**能服务该 realm** 的账号总数。realm=="" 时不过滤（全部账号）；
+//     非空时只数 Realm()==realm 的账号——跨域账号对该模型的可用性没有意义
+//     （CN 模型在 global 账号上必然 11102，混算会把 CN 模型误判成"有账号可用"）。
+//   - avail  = 其中**当前能选来跑该模型**的账号数，判据与选号路径同源
+//     （healthyForModel + 未在途满额），保证「列出来 = 真的选得到」。
+//     冻结/禁用/熔断/冷却/该模型 11102 或 6004 冷却/在途满额，都计入不可用。
+//
+// 不用 AvailableUIDsForModel：那个走 WeightedAvailableUIDs（按积分加权抽样），
+// 只看权重非零，会把"在途满额"等选号侧最终会拒掉的状态算成可用。
+//
+// 不取 p.mu 之外的锁、不做网络调用：供 /v1/models 每个模型一次调用（目录 ~50 条）。
+func (p *Pool) ModelAvailability(model, realm string) (avail, total int) {
+	if model == "" {
+		return 0, 0
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		total++
+		// healthyForModel 已含：禁用/冻结/熔断/账号冷却/该模型 6004 冷却/该模型 11102 负缓存。
+		if !p.availableForModelLocked(e, model, now) {
+			continue
+		}
+		avail++
+	}
+	return avail, total
+}
+
+// ModelAvailabilityAll 返回池中每个「已知不可用」模型的可用账号数（批量形态）。
+// 是 ModelAvailability 的批量包装，供只想拿"还能选到几个账号"的调用方使用；
+// 需要证据面（Blocked/Healthy）时用 ModelUnavailableEvidenceAll。
+func (p *Pool) ModelAvailabilityAll(realm string) map[string]int {
+	ev := p.ModelUnavailableEvidenceAll(realm)
+	out := make(map[string]int, len(ev))
+	for m, e := range ev {
+		out[m] = e.Available
+	}
+	return out
+}
+
+// availableForModelLocked 单账号对单模型"当前可选"的判据（选号路径同源）：
+// healthyForModel 已含禁用/冻结/熔断/账号冷却/该模型 6004 或 11102 冷却；
+// 再排除在途满额（Pick 会跳过）。调用方必须已持有 p.mu。
+func (p *Pool) availableForModelLocked(e *entry, model string, now time.Time) bool {
+	return e.healthyForModel(now, model) && !p.inFlightFull(e)
 }

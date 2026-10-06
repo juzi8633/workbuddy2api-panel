@@ -15,6 +15,8 @@
 //	breakerUntil       ← recordBreakerFailureLocked（Cooldown/NoteError 喂入）；NoteSuccess 清
 //	softStreak         ← Cooldown(CoolSoft)/CooldownSoftForModel；NoteSuccess 清（revive 保留：与余额无关）
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
+//	frozen             ← freezeLocked（SetFreezeThreshold / checkFreezeLocked）；
+//	                     unfreezeLocked（余额回到阈值以上 / 关阈值）/ Revive 清
 //
 // 关键正交性（疑点 4 修正）：
 //   - 冷却域（until/coolKind/softStreak/modelCooldowns）与熔断器（fails/retryCount/
@@ -51,7 +53,63 @@ func (e *entry) clearCoolingLocked() {
 func (p *Pool) disableLocked(e *entry, reason string) {
 	e.clearCoolingLocked()
 	e.disabled = true
+	e.paused = false // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
 	e.reason = reason
+	p.dirty.Store(true)
+}
+
+// pauseLocked 暂停选号迁移：置 paused 使账号退出选号候选（healthy 判否），
+// 但**不动任何惩罚域**——paused 是「临时让位」，账号本身健康，恢复后冷却/熔断
+// 观测仍有效。与 disableLocked 的对比：disabled 清冷却域且须人工 revive（终态），
+// paused 只置一个标志、随时可 resume（瞬时态）。
+// 保号任务（scheduler）遍历只按 Disabled 过滤，故 paused 号天然继续参与签到/
+// 活跃上报/保活/余额刷新——这正是「暂停选号但不掉保号」的实现基础。
+func (p *Pool) pauseLocked(e *entry) {
+	e.paused = true
+	p.dirty.Store(true)
+}
+
+// resumeLocked 解除暂停选号（幂等）：只清 paused，账号若不在其它惩罚期即恢复可选。
+func (p *Pool) resumeLocked(e *entry) {
+	e.paused = false
+	p.dirty.Store(true)
+}
+
+// freezeReason 低积分自动冻结的固定原因文案（冻结核的 frozenReason 唯一取值）。
+// 与冷却/禁用共用字段的 reason 分列：reason 归冷却/禁用域，冻结不污染它。
+const freezeReason = "低积分自动冻结"
+
+// freezeLocked 低积分冻结迁移：置 frozen/frozenReason 并清冷却域。
+//
+// 清冷却域的理由与 disableLocked 同构：账号已退出选号，冷却截止不再被读取，
+// 留着会呈现「冻结但仍然 cooling」的杂交态（健康判定虽以 frozen 先行返回 false，
+// 但 /status 的 cooling/until 字段会误导运维）。
+//
+// 与 disableLocked 的差异（正交性）：
+//   - **不清**熔断观测（fails/retryCount/breakerUntil）：冻结是「余额不足」的
+//     临时出池，熔断是「连续 5xx」的独立信号，复苏后熔断观测仍有效；
+//   - **不清** sessionDeadFails / consecutiveFails（熔断/连败观测保留）；
+//   - 不清 disabled：冻结与禁用正交，禁用号被冻结不改变其禁用终态。
+//
+// 调用方必须已持有 p.mu（SetFreezeThreshold / checkFreezeLocked 持锁下调用）。
+func (p *Pool) freezeLocked(e *entry) {
+	e.clearCoolingLocked()
+	e.frozen = true
+	e.frozenReason = freezeReason
+	p.dirty.Store(true)
+}
+
+// unfreezeLocked 低积分冻结解除迁移：只清 frozen/frozenReason。
+//
+// **不清**冷却/熔断/降权与各计数器：它们是各自维度的观测，各有自身恢复时刻
+// （冷却到期、熔断到期或下次成功、连败降权到期）——余额恢复不构成这些维度的
+// 解除证据（同 reviveCoolingLocked 的口径）。解冻后账号是否可选由 healthy()
+// 按剩余维度自然判定。
+//
+// 调用方必须已持有 p.mu。
+func (p *Pool) unfreezeLocked(e *entry) {
+	e.frozen = false
+	e.frozenReason = ""
 	p.dirty.Store(true)
 }
 

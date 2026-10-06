@@ -1,9 +1,13 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"log"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -323,7 +327,7 @@ func TestNormalizeToolPatterns(t *testing.T) {
 	}
 
 	t.Run("exa agent_run pattern normalized", func(t *testing.T) {
-		bs := string(byte(92)) // 反斜杠，测试体经工具链多层转义易被吞，运行时拼装保真
+		bs := string(byte(92))                                                                                                                                                                                                                                                                                                                // 反斜杠，测试体经工具链多层转义易被吞，运行时拼装保真
 		body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"agent_run","parameters":{"type":"object","properties":{"runId":{"type":"string","pattern":"^agent` + bs + bs + `_run` + bs + bs + `_"}` + `,"query":{"type":"string"}},"required":["query"]}}}]}` //nolint:lll // 实案 body 原样
 		out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
 		if got := lookupPattern(t, out, "tools", 0, "function", "parameters", "properties", "runId", "pattern"); got != `^agent_run_` {
@@ -427,4 +431,144 @@ func TestNormalizeToolPatterns(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestClampGPTMinMaxTokens GPT 系上游要求 max_tokens ≥ 16（实测 gpt-6-sol/gpt-6-luna/
+// gpt-5.6-sol：15 → 400 code=11133 model_param_invalid，16 → 200）。Claude Code 切
+// 模型时的探针请求 max_tokens 极小，全号轮转同样被拒 → 客户端 503。非 GPT 模型不动。
+func TestClampGPTMinMaxTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want any // nil 表示字段不存在
+	}{
+		{"gpt below floor", `{"model":"gpt-6-sol","max_tokens":1,"messages":[]}`, float64(16)},
+		{"gpt global prefix", `{"model":"global:gpt-5.6-sol","max_tokens":15,"messages":[]}`, float64(16)},
+		{"gpt at floor", `{"model":"gpt-6-luna","max_tokens":16,"messages":[]}`, float64(16)},
+		{"gpt above floor", `{"model":"gpt-6-sol","max_tokens":32000,"messages":[]}`, float64(32000)},
+		{"gpt alias translated then clamped", `{"model":"gpt-6-sol","max_completion_tokens":1,"messages":[]}`, float64(16)},
+		{"gpt absent untouched", `{"model":"gpt-6-sol","messages":[]}`, nil},
+		{"non-gpt untouched", `{"model":"hy4-preview-f","max_tokens":1,"messages":[]}`, float64(1)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			obj, err := decodeBody(PrepareBodyOptWithEffertsPreserve(t, c.body))
+			if err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			got, has := obj["max_tokens"]
+			if c.want == nil {
+				if has {
+					t.Fatalf("max_tokens = %v, want absent", got)
+				}
+				return
+			}
+			if got != c.want {
+				t.Fatalf("max_tokens = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestEffortRewriteLoggedOnce 降档/兜底日志按「模型+请求档+实际档+方向」去重。
+//
+// 背景（实测生产）：claude-cli 对 deepseek-v4.1-flash 固定发 medium，而该模型
+// supportedEfforts 不含 medium，于是每个请求都降档一次——13 小时 1368 行同一句
+// `medium -> low`，把真正有价值的请求行挤出 journal。downgrade 本身是对的
+// （normalizeReasoningEffort 的职责），要改的只是日志。
+//
+// 本用例钉住两件事，缺一不可：
+//
+//	① 同一组合重复出现只打印一次（噪音消失）；
+//	② 换模型 / 换请求档 / 换实际档 / 换方向 必须重新打印（信息不丢）——
+//	   若哪天把去重键简化成只看 model，这条会 FAIL。
+//
+// 断言方式是捕获标准 logger 的输出（log.SetOutput 到 buffer），逐行数匹配。
+func TestEffortRewriteLoggedOnce(t *testing.T) {
+	// 去重表是**进程级**的（这正是它的目的：跨请求、跨 goroutine 生效）。
+	// 测试必须自己清空它，否则 `go test -count=2` 第二轮就一条都不打了、
+	// 对「必须打印」的反向断言（m-b / m-c）会假失败——用 `-count=2` 能复现。
+	effortRewriteLogged.Range(func(k, _ any) bool {
+		effortRewriteLogged.Delete(k)
+		return true
+	})
+
+	restore, drain := logCapture(t)
+	defer restore()
+
+	efforts := map[string][]string{
+		"m-a": {"low"},           // 请求 medium → 降级 low
+		"m-b": {"low"},           // 同映射，不同模型 → 应各自打一次
+		"m-c": {"high"},          // 请求 low → 兜底（全部高于请求档）
+		"m-d": {"low", "medium"}, // 请求 medium → 命中，不打印
+	}
+	body := func(model, effort string) []byte {
+		return []byte(`{"model":"` + model + `","reasoning_effort":"` + effort + `","messages":[]}`)
+	}
+	// 每个组合各跑 5 次：只有首行该留下。
+	for i := 0; i < 5; i++ {
+		PrepareBodyOptWithEfforts(body("m-a", "medium"), false, efforts)
+		PrepareBodyOptWithEfforts(body("m-b", "medium"), false, efforts)
+		PrepareBodyOptWithEfforts(body("m-c", "low"), false, efforts)
+		PrepareBodyOptWithEfforts(body("m-d", "medium"), false, efforts)
+	}
+
+	out := drain()
+	got := map[string]int{}
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "reasoning_effort") {
+			continue
+		}
+		switch {
+		case strings.Contains(line, "model=m-a"):
+			got["m-a"]++
+		case strings.Contains(line, "model=m-b"):
+			got["m-b"]++
+		case strings.Contains(line, "model=m-c"):
+			got["m-c"]++
+		case strings.Contains(line, "model=m-d"):
+			got["m-d"]++
+		}
+	}
+	if got["m-a"] != 1 {
+		t.Errorf("m-a 打印 %d 次, want 1（同组合去重）", got["m-a"])
+	}
+	if got["m-b"] != 1 {
+		t.Errorf("m-b 打印 %d 次, want 1（不同模型须各自打印一次）", got["m-b"])
+	}
+	if got["m-c"] != 1 {
+		t.Errorf("m-c 打印 %d 次, want 1（floored 方向也要去重且要打印）", got["m-c"])
+	}
+	if got["m-d"] != 0 {
+		t.Errorf("m-d 打印 %d 次, want 0（档位被支持，不该改写、不该打印）", got["m-d"])
+	}
+}
+
+// logCapture 捕获标准 logger 的输出，供「日志去重」类用例断言。
+// 返回 restore 与 drain：drain 取出并清空到目前为止的累计输出。
+func logCapture(t *testing.T) (restore func(), drain func() string) {
+	t.Helper()
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&lockedWriter{mu: &mu, w: &buf})
+	return func() { log.SetOutput(prev) }, func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		s := buf.String()
+		buf.Reset()
+		return s
+	}
+}
+
+// lockedWriter 串行化 log 包与测试 goroutine 之间的写入。
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
