@@ -30,8 +30,30 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.12.0-panel"
+// appVersion 网关版本号 = **批次身份**，透出到 /panel/api/overview 的 version，
+// 同时用作面板静态资源的 cache-busting 键（app.js?v=<它>，见 panel.assetVersion）。
+//
+// 命名规则：<上游版本>-wb<本 fork 第几个发版>
+//
+//	1.11.11      = 上游 v1.11.11（本 fork 的基线）
+//	-wb8         = 本 fork 的第 8 个发版
+//
+// 为什么不再往后面堆特性名（曾经是
+// "1.11.11-panel+freeze+cache+expiry+credits+catalog+filter+hits+evidence"）：
+//   - 一个串同时承担"版本号 / 缓存键 / 变更日志"三件事，结果三件都不合格：
+//     当版本号太长、当指纹不够（同一批内所有构建共享同一值——曾导致两个**不同**的
+//     二进制都报 "1.11.11-panel"，光看版本号分不出）、当日志又必须手打维护（打错
+//     过一次：把 PR #93 的 gofmt 改动写成"排程墙钟修复"）。
+//   - 特性清单的正确归属是 CHANGELOG.md（人读、可写长、不占二进制），
+//     产物指纹的正确归属是 overview 的 build 字段（机器算、自证）。
+//
+// 硬要求：每批发版必须让它变化（cache-busting 依赖"版本一变 URL 一变"）。
+// 加一批就 wb8 → wb9，并把该批内容记进 CHANGELOG.md。
+//
+// 上游 CI 有一条 tag 断言会 `SRC="${SRC%-panel}"` 后比 tag，因此带 "+特性" 的后缀
+// 本就不满足它（我们从没跑过上游 CI）。改成 "-wbN" 同样不满足，但至少是**有意**的
+// 命名，而不是把三件事塞进一个串的副产品。
+const appVersion = "1.12.0-wb17"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -273,6 +295,7 @@ func main() {
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
 		Version:     appVersion,
+		Build:       panel.SelfBuildID(),
 		Live:        live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
@@ -292,19 +315,20 @@ func main() {
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		Panel:        pn,
-		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		Pool:            p,
+		Upstream:        up,
+		APIKey:          cfg.APIKey,
+		BodyReadTimeout: cfg.ServerReadTimeoutDur,
+		Session:         sessRouter,
+		StickyCount:     sessCount,
+		RedisMode:       redisMode,
+		SoftCooldown:    cfg.SoftRateDur,
+		Panel:           pn,
+		Live:            live,
+		Usage:           rec,
+		RequestLog:      requestLog,
+		PromptMode:      cfg.Prompt.Mode,
+		PromptText:      cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
@@ -325,21 +349,7 @@ func main() {
 	// 异步执行：不阻塞监听启动；失败仅记日志（下一轮懒触发或本轮重试仍可补上）。
 	go warmModelRates(ctx, up, p)
 
-	srv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           h,
-		ReadHeaderTimeout: 30 * time.Second,
-		// ReadTimeout 覆盖整个请求读取（含 body 上传）：防慢速 body 拖死连接。
-		// 请求体已无网关侧上限（max_body_mb 移除）。缺省 300s（issue #100：旧固定
-		// 60s 会掐掉大上下文/文件块经反代链的慢速上传，客户端收到
-		// 400 "read body: ... i/o timeout"）；server.read_timeout="0" 显式关闭。
-		// 改动需重启进程。
-		ReadTimeout: cfg.ServerReadTimeoutDur,
-		// IdleTimeout keep-alive 空闲连接回收：配合 chat 出站 ctx 传播防连接泄漏堆积。
-		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout
-		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
-		IdleTimeout: 120 * time.Second,
-	}
+	srv := newHTTPServer(cfg.Listen, h, cfg.ServerReadTimeoutDur)
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机

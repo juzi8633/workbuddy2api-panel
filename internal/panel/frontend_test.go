@@ -712,6 +712,37 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// TestUsageChartCreditSeries 用量图的积分序列必须在 Node 里真跑一遍——三种形态
+// 各断言一次（issue #58 的渲染契约）：
+//
+//	形态 1「全 0 观测」：credit_samples=1 且 credits=0（明确免费）→ **必须画点**。
+//	        这是修复前的实际缺陷：条件写成 hasCr && maxCr>0，全 0 时 maxCr=0，
+//	        整条积分轴连同圆点一起消失，于是"观测到 0 分"退化成"没有数据"。
+//	形态 2「混合」：一个 0 分 + 一个 2.5 分 → 两点 + 一条折线。
+//	形态 3「无观测」：credit_samples=0 → 不画积分轴（不能捏造一条零线）。
+//
+// 为什么必须跑真代码：app.js 是 go:embed 的静态资源，Go 编译器不检查其内容；
+// 上面的 TestAppJSSyntax 只保证"语法能解析"，算错/条件写错它一样全绿。
+// 无 node 环境时跳过（与 TestAppJSSyntax 同策略，不阻塞无 Node 的构建机）。
+func TestUsageChartCreditSeries(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; skipping chart behaviour check")
+	}
+	path, err := filepath.Abs("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := filepath.Abs("testdata/chart_credit_check.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, script, path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("用量图积分序列渲染不符合契约:\n%s", out)
+	}
+}
+
 // TestAppJSCollectConfigClearable 钉住 collectConfig 的空串语义。
 //
 // 覆盖型字段（user_agent / prompt_file）空串必须照发：漏发会让面板显示"已保存"

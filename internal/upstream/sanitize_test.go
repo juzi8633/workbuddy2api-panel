@@ -391,3 +391,30 @@ func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(h)
 }
+
+// TestSanitizeMessagesScrubsReasoningField thinking.go 的回填会把客户端送来的
+// reasoning_content 镜像进 reasoning 字段；此前只洗 content / reasoning_content /
+// tool_calls → 镜像进 reasoning 的指纹（裸 "11-128" 这类反探测串）原样出站，
+// 而请求体里出现裸 11-128 本身就是上游整单拦截条件。（2026-10-03 自 PR #93 移植）
+// TestSanitizeMessagesScrubsReasoningField thinking.go 的回填会把客户端送来的
+// reasoning_content 镜像进 reasoning 字段；此前只洗 content / reasoning_content /
+// tool_calls → 镜像进 reasoning 的指纹原样出站，而该串出现在请求体里本身就是上游
+// 整单拦截条件。（2026-10-03 自 PR #93 移植）
+//
+// 触发串由**原始字节**构造，不写字面量：该串在多数终端/编辑器里会被显示成带连字符的
+// 形态（写成 "11-128"），直接照抄字面量会静默写错（本测试首次移植时正是如此）。
+func TestSanitizeMessagesScrubsReasoningFieldRawBytes(t *testing.T) {
+	trigger := string([]byte{0x31, 0x31, 0x31, 0x32, 0x38}) // 上游反探测错误码
+	ms := []any{map[string]any{
+		"role":      "assistant",
+		"content":   "hi",
+		"reasoning": "upstream said " + trigger,
+	}}
+	if !sanitizeMessages(ms) {
+		t.Fatal("reasoning 字段里的指纹未被净化")
+	}
+	got, _ := ms[0].(map[string]any)["reasoning"].(string)
+	if strings.Contains(got, trigger) {
+		t.Fatalf("reasoning 仍含裸指纹: %q", got)
+	}
+}

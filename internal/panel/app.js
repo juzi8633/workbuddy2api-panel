@@ -380,6 +380,9 @@ function renderAccounts(list) {
     let cls = '', tag;
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
     else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
+    // 冻结优先于冷却展示：冻结是持续性状态（余额回到阈值以上才自动解除），
+    // 冷却带倒计时——两者同时存在时报冻结更能解释"为什么这个号不参与选号"。
+    else if (s.frozen) { cls = 'cool'; tag = '<span class="tag warn">低积分冻结</span>'; }
     else if (cool > 0) {
       cls = 'cool';
       const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
@@ -401,7 +404,10 @@ function renderAccounts(list) {
       credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
         '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
     }
-    const frozen = s.disabled || cool > 0;
+    // 「解冻」按钮的适用面 = 处于惩罚态的号：禁用 / 低积分冻结 / 冷却中。
+    // pool.Revive 一次清掉这三类（清禁用、冷却、熔断运行态与低积分冻结），
+    // 冷却号显示解冻是原有行为（手工提前恢复），本次只把冻结纳入同一口径。
+    const penalized = s.disabled || s.frozen || cool > 0;
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
@@ -427,7 +433,8 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
-        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
+        '<button class="xs ghost" data-a="threshold" data-u="' + esc(s.uid) + '">阈值</button>' +
+        (penalized ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>')) +
         (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
@@ -479,6 +486,8 @@ async function loadOverview(quiet) {
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
+    // 低积分冻结单列（与「冷却中」互斥）：冻结无倒计时，与冷却不是同一类运维处置。
+    $('sFrozen').textContent = d.frozen || 0;
     $('sDisabled').textContent = d.disabled;
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
@@ -514,7 +523,15 @@ $('accBody').addEventListener('click', async ev => {
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
-      toast('已解冻', 'ok');
+      // Revive 按设计不清阈值：余额仍低于阈值的号会在下一次余额刷新（周期任务默认
+      // 每 5 分钟）被自动重新冻结。按行数据（revive 前的 overviewData）补一句解释，
+      // 避免运维误以为「解冻按钮点了没用/自己回退」——界面必须给出原因。
+      const row = ((overviewData && overviewData.accounts) || []).find(x => x.uid === u);
+      if (row && row.frozen && (row.credits || 0) < (row.freeze_threshold || 0)) {
+        toast('已解冻（余额 ' + (row.credits || 0) + ' 仍低于阈值 ' + row.freeze_threshold + '，下次余额刷新将重新冻结）', 'ok');
+      } else {
+        toast('已解冻', 'ok');
+      }
     } else if (a === 'disable') {
       await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
       toast('已禁用', 'ok');
@@ -526,6 +543,23 @@ $('accBody').addEventListener('click', async ev => {
       toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
+    } else if (a === 'threshold') {
+      // 阈值预填当前值：从行数据（overviewData.accounts 就是本表渲染源）取，
+      // 不用 DOM 存值——列表每次操作后整体重渲染，两者不会不同步。
+      const row = ((overviewData && overviewData.accounts) || []).find(x => x.uid === u);
+      const current = (row && row.freeze_threshold) || 0;
+      const input = prompt('设置低积分冻结阈值（0 = 关闭）', current);
+      if (input === null) return; // 用户取消
+      const threshold = parseInt(input, 10);
+      if (isNaN(threshold) || threshold < 0) {
+        toast('请输入有效的非负整数', 'err');
+        return;
+      }
+      await api('accounts/' + encodeURIComponent(u) + '/freeze_threshold', {
+        method: 'POST',
+        body: JSON.stringify({ threshold: threshold })
+      });
+      toast('阈值已设置为 ' + threshold, 'ok');
     } else if (a === 'remove') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
@@ -697,9 +731,18 @@ function mdRowHtml(m, pr) {
   if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
   if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
+  // 当前不可用：池内全体账号都撞过 11102（模型级"该后端无此模型"，与账号无关）。
+  // 由后端 pool.ModelAvailabilityAll 标记，与 /v1/models 的剔除同一判据——客户端
+  // 看不到它，运维在面板能看到并知道为什么。徽标进 caps 之上，单列一行更醒目。
+  const unavail = m.unavailable === true;
+  if (unavail) caps.unshift('<span class="tag bad">当前不可用</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
-  const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  const tip = (m.description ? esc(m.description) : '') +
+    (unavail ? (m.description ? '\n' : '') + '池内全部账号实测该模型不可用（11102 该后端无此模型）；换号无效，需上游开通权益。' : '');
+  const tipAttr = tip ? ' title="' + tip + '"' : '';
+  // 不可用行降饱和：一眼扫过去能区分"能用/不能用"，但不隐藏（面板保留可见性）。
+  const rowCls = unavail ? ' class="md-unavail"' : '';
+  return '<tr' + rowCls + '><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tipAttr + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
     '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
@@ -716,9 +759,13 @@ function renderModels() {
     tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m.id))).join('');
   }
   const filtered = list.length !== mdAll.length;
+  // 不可用计数单列：修复三路 UA 并集后目录 19→48，其中十来个是池内全号都 11102 的。
+  // 运维需要一眼知道"这 48 个里几个现在真能用"，否则看到长列表会以为都能选。
+  const unavail = mdAll.filter(m => m.unavailable === true).length;
+  const unavailNote = unavail ? ' · ' + unavail + ' 个当前不可用' : '';
   $('mdCount').textContent = !mdAll.length ? ''
-    : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
-    : mdAll.length + ' 个模型';
+    : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型' + unavailNote
+    : mdAll.length + ' 个模型' + unavailNote;
   $('mdCount').className = filtered ? 'note src-off' : 'note';
 }
 
@@ -2105,8 +2152,13 @@ function renderUsageChart(series) {
     if (t === null) continue;
     const pt = Number(p.prompt_tokens || 0);
     const ct = Number(p.completion_tokens || 0);
+    // 积分：本桶「与积分同时观测到的 Token」样本数 crs 是**有没有观测到**的判据
+    // （issue #58）。crs=0 表示这段没观测到积分（升级前的历史、或上游没回
+    // usage.credit），此时不能画成"扣了 0 分"——曲线在那里断开。
     pts.push({ t, scope: p.scope, raw: p.t, pt, ct, tt: Number(p.total_tokens || 0) || (pt + ct),
-               req: p.requests || 0 });
+               req: p.requests || 0,
+               cr: Number(p.credits || 0), crs: Number(p.credit_samples || 0),
+               crt: Number(p.credit_tokens || 0) });
   }
   if (!pts.length) {
     host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
@@ -2114,8 +2166,16 @@ function renderUsageChart(series) {
     return;
   }
 
-  const W = 1200, H = 200, PL = 58, PR = 14, PT = 18, PB = 30;
+  // 有积分观测就启用右侧第二条 y 轴（单位是积分，与 token 不同量纲，不能堆叠）。
+  // 右侧留 52px 给积分刻度与「积分」轴名。
+  const hasCr = pts.some(p => p.crs > 0);
+  const W = 1200, H = 200, PL = 58, PR = hasCr ? 52 : 14, PT = 18, PB = 30;
   const iw = W - PL - PR, ih = H - PT - PB;
+  const maxCr = hasCr ? Math.max(0, ...pts.filter(p => p.crs > 0).map(p => p.cr)) : 0;
+  // crScale 只用于定标：maxCr==0（全部观测都是"明确 0 分"）时不能让除法变成
+  // NaN/Inf，也不能因为 maxCr>0 这个附加条件把整条积分轴隐藏掉——"观测到 0 分"
+  // 与"没有观测"是两件事，前者必须看得见（圆点落在基线上）。
+  const crScale = maxCr > 0 ? maxCr : 1;
 
   const t0 = pts[0].t;
   const t1 = pts[pts.length - 1].t;
@@ -2124,9 +2184,11 @@ function renderUsageChart(series) {
   const max = Math.max(1, ...pts.map(p => p.tt));
   const peak = pts.reduce((a, b) => (b.tt > a.tt ? b : a), pts[0]);
   const avg = pts.reduce((s, p) => s + p.tt, 0) / pts.length;
+  const crTot = pts.reduce((s, p) => s + p.cr, 0);
   $('usChartNote').textContent =
     pts.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' + fmtTokTimeLabel(peak) +
-    ' · 均值 ' + fmtTok(avg);
+    ' · 均值 ' + fmtTok(avg) +
+    (hasCr ? ' · 扣除积分 ' + fmtCredit(crTot) + '（橙线，右轴）' : '');
 
   // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
   // 变细，但不会细到看不见。
@@ -2165,6 +2227,25 @@ function renderUsageChart(series) {
            '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
   }
 
+  // 右轴：积分刻度（与左轴 token 同高但独立量纲）。刻度值用整数，避免出现
+  // "0.3 分"这种读不出意义的标注；轴名放最上方，用户一眼知道橙线是什么。
+  const yCr = v => PT + ih - ih * (v / crScale);
+  if (hasCr) {
+    if (maxCr > 0) {
+      for (let i = 0; i <= 4; i++) {
+        const y = PT + ih - (ih * i / 4);
+        out += '<text class="tk" x="' + (W - PR + 6) + '" y="' + (y + 3.5).toFixed(1) +
+               '" text-anchor="start">' + fmtCredit(maxCr * i / 4) + '</text>';
+      }
+    } else {
+      // 全部观测都是 0 分：只标基线，不伪造刻度。
+      out += '<text class="tk" x="' + (W - PR + 6) + '" y="' + (PT + ih + 3.5).toFixed(1) +
+             '" text-anchor="start">0</text>';
+    }
+    out += '<text class="tk-avg" x="' + (W - PR + 6) + '" y="' + (PT - 6) +
+           '" text-anchor="start">积分</text>';
+  }
+
   // 均值参考线：一眼看出"这根是不是异常高"，比只给刻度省心。
   // 标签放左侧：右侧常被峰值柱占用（峰值柱往往就是最后一根），贴左不会被压住。
   if (avg > 0 && avg < max) {
@@ -2192,7 +2273,37 @@ function renderUsageChart(series) {
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
       '" fill="url(#usGradC)" rx="1.5"/>';
     out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
-           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+           fmtTok(p.ct) + ' completion / ' + p.req + ' 次' +
+           (p.crs > 0 ? ' / 扣除 ' + fmtCredit(p.cr) + ' 积分' : ' / 无积分观测') +
+           '</title>';
+  }
+
+  // 积分折线（橙，右轴）。**只连有观测的相邻点**：crs=0 的桶不参与折线，
+  // 于是序列在那里自然断开——这正是"这段没数据"与"这段扣了 0 分"的区分
+  // （issue #58 的核心诉求：看得清每小时扣多少，而不是一个累计总数）。
+  // 单点观测画圆点：折线需要两点才能画，而只有一个有积分的小时也该被看见。
+  if (hasCr) {
+    const segs = [];
+    let cur = [];
+    for (const p of pts) {
+      if (p.crs > 0) { cur.push(p); } else if (cur.length) { segs.push(cur); cur = []; }
+    }
+    if (cur.length) segs.push(cur);
+    for (const seg of segs) {
+      if (seg.length >= 2) {
+        out += '<polyline fill="none" stroke="var(--warn)" stroke-width="1.6" ' +
+               'stroke-linejoin="round" stroke-linecap="round" points="' +
+               seg.map(p => xOf(p.t).toFixed(2) + ',' + yCr(p.cr).toFixed(2)).join(' ') + '"/>';
+      }
+    }
+    // 观测点圆点：太小看不清，太大压住柱子，2.6 是折线宽 1.6 的视觉平衡点。
+    for (const p of pts) {
+      if (p.crs <= 0) continue;
+      out += '<circle cx="' + xOf(p.t).toFixed(2) + '" cy="' + yCr(p.cr).toFixed(2) +
+             '" r="2.6" fill="var(--warn)"><title>' + esc(p.raw) + '  扣除 ' +
+             fmtCredit(p.cr) + ' 积分 / ' + fmtTok(p.crt) + ' tok / ' + p.crs +
+             ' 个样本</title></circle>';
+    }
   }
 
   // 峰值标注：柱子够窄时文字压在柱顶，够宽时贴右侧避免和柱体重叠。

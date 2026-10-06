@@ -196,11 +196,28 @@ type fakeUpstream struct {
 	travelCalls    atomic.Int32
 	resourceRemain int64
 	resourceEnd    string
+	nightChatCalls atomic.Int32
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/info"):
+			// 已领养（data.buddy 非空）：跳过领养前置，直接进旅行状态查询。
+			w.Write([]byte(`{"code":0,"data":{"buddy":{"id":1,"name":"cat"}}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/tasks"):
+			// 黑猫待办：每个账号恒差 1 次夜聊（让 BlackcatNeed 返回 1）。
+			w.Write([]byte(`{"code":0,"data":{"tasks":[{"task_code":"black_cat","current":0,"target":1,"claimed":false}]}}`))
+		case strings.HasSuffix(r.URL.Path, "/v2/chat/completions"):
+			// 夜猫子真实对话帧。need=1 故每号只打一次（RunNightChats 内 4s sleep，
+			// 多用例串行会拖时间——1 次足够判定某号是否被拉出来发对话）。
+			f.nightChatCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"2\"}}]}\n\ndata: [DONE]\n\n"))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/travel/status"):
+			// daily_limit_reached=true：状态查询计一次调用即止，不发 depart/claim。
+			f.travelCalls.Add(1)
+			w.Write([]byte(`{"code":0,"data":{"state":"idle","daily_limit_reached":true}}`))
 		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
 			f.checkinCalls.Add(1)
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
@@ -216,13 +233,6 @@ func (f *fakeUpstream) server() *httptest.Server {
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			f.refreshCalls.Add(1)
 			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
-		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/info"):
-			// 已领养（data.buddy 非空）：跳过领养前置，直接进旅行状态查询。
-			w.Write([]byte(`{"code":0,"data":{"buddy":{"id":1,"name":"cat"}}}`))
-		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/travel/status"):
-			// daily_limit_reached=true：状态查询计一次调用即止，不发 depart/claim。
-			f.travelCalls.Add(1)
-			w.Write([]byte(`{"code":0,"data":{"state":"idle","daily_limit_reached":true}}`))
 		default:
 			http.Error(w, "not found", 404)
 		}
@@ -674,7 +684,6 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 	}
 }
 
-
 // TestPausedStillTravels 暂停号照常跑旅行：旅行是纯 RPC（状态/派出/领奖 +
 // 领养前置上报），不发模型对话，与「让位防风控」不冲突——唯一被跳过的
 // 对话类任务只有夜猫子（RunNightChats 真实 ChatStream）。
@@ -693,5 +702,42 @@ func TestPausedStillTravels(t *testing.T) {
 	s.RunTravelNow()
 	if got := f.travelCalls.Load(); got != 2 {
 		t.Errorf("travel status calls=%d want 2（u1 + 暂停号 u2 照常旅行）", got)
+	}
+}
+
+// TestBlackcatSkipsPausedAccount 夜猫子必须跳过暂停选号（paused）账号。
+//
+// 夜猫子是全任务体系中唯一「整任务都是真实模型对话」的（RunNightChats 逐条
+// ChatStream 发 glm-5.2 短对话）。暂停号的语义是「让位——不再从同一出口 IP
+// 发模型对话」；若夜猫子不跳过，被让位的号仍会在 23:00 被拉出来发对话，
+// 与 #113 的目的正面冲突。上游 v1.12.0 补的正是这一行（b1a2284）。
+//
+// 手法：fake 对每个账号都下发 black_cat 待办（差 1 次），并统计
+// /v1/chat/completions 次数。修复前 paused 号会走完 BlackcatNeed →
+// RunNightChats，于是对话次数 > 1；修复后只有 u1 产生对话。
+// 禁用号 u3 作对照（本就跳过，两版都不该出现）。
+func TestBlackcatSkipsPausedAccount(t *testing.T) {
+	f := &fakeUpstream{}
+	srv := f.server()
+	defer srv.Close()
+
+	now := time.Now()
+	if !upstream.InNightWindow(now) {
+		// 窗口外 RunBlackcatNow 整段早退，本用例没有判别力。明确 skip 而不是假装通过。
+		t.Skipf("当前 %s 不在 23:00–08:00 夜猫子窗口，该用例需要窗口内时钟", now.Format("15:04"))
+	}
+
+	p := pool.New("")
+	for _, uid := range []string{"u1", "u2", "u3"} {
+		p.Add(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	}
+	p.Pause("u2")           // 暂停选号 → 夜猫子必须跳过
+	p.Disable("u3", "test") // 禁用 → 对照组
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunBlackcatNow()
+	if got := f.nightChatCalls.Load(); got != 1 {
+		t.Errorf("夜猫子对话次数=%d want 1（仅 u1；暂停号 u2 与禁用号 u3 必须跳过）", got)
 	}
 }

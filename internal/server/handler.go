@@ -6,11 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"net/http"
-	"os"
 	"strings"
 
 	"sync"
@@ -30,10 +27,13 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	APIKey   string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
+	// BodyReadTimeout matches the HTTP server's total read limit. When zero,
+	// readBody enforces an idle limit instead of limiting ongoing uploads.
+	BodyReadTimeout time.Duration
+	MaxRotate       int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -179,7 +179,7 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
-	total, healthy, _, _, _ := h.cfg.Pool.CountsDetailed()
+	total, healthy, _, _, _, _ := h.cfg.Pool.CountsDetailed()
 	// 用 ServableNow 判定：healthy>0 但全占满在途时 chat 会 503，探活必须同口径，
 	// 否则负载均衡器会把流量持续打进无法受理的实例。
 	status := http.StatusOK
@@ -203,7 +203,7 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
-	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
+	total, healthy, cooling, frozen, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
 	sticky := 0
 	if h.cfg.StickyCount != nil {
 		sticky = h.cfg.StickyCount()
@@ -217,14 +217,18 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	// 行对照即可读出「探索→毕业」全链路（单一事实来源，不做双表示）。零回归只增键。
 	exploreEvents, exploreLast := h.cfg.Pool.CostExploreStatus()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":       h.cfg.Pool.List(),
-		"total":          total,
-		"healthy":        healthy,
-		"cooling":        cooling,
+		"accounts": h.cfg.Pool.List(),
+		"total":    total,
+		"healthy":  healthy,
+		"cooling":  cooling,
+		// frozen 低积分冻结单列：与 cooling 互斥（冻结无倒计时，汇总需能看出冻结规模）。
+		// 只新增键，既有汇总键语义调整仅限冻结号不再计入 cooling（该功能此前根本不存在
+		// 冻结号，未开启冻结的部署计数与旧版完全一致）。
+		"frozen":         frozen,
 		"disabled":       disabled,
 		"in_flight_full": inFlightFull,
 		// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
-		// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
+		// 只新增键，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
 		"realm_totals": map[string]map[string]int{
 			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
 			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
@@ -247,12 +251,13 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// countsMapFrom 把 CountsDetailed 五元组打包成 /status 的域分组建模。
-func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[string]int {
+// countsMapFrom 把 CountsDetailed 六元组打包成 /status 的域分组建模。
+func countsMapFrom(total, healthy, cooling, frozen, disabled, inFlightFull int) map[string]int {
 	return map[string]int{
 		"total":          total,
 		"healthy":        healthy,
 		"cooling":        cooling,
+		"frozen":         frozen,
 		"disabled":       disabled,
 		"in_flight_full": inFlightFull,
 	}
@@ -357,9 +362,72 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 // modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
 // 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
+// unavailableModelIDs 返回「池内全不可用」的 CN 模型集合，供 /v1/models 剔除。
+//
+// 为什么只能"实证"而不能"声明"：上游目录**不声明权益**——实测 modelTiers 的
+// requiredUserType 恒为 standard、vendor（e/f/tencent）与可调用性无关、桌面端目录
+// 里连 disabled 字段都没有。唯一能事前知道某模型不可用的信号就是自己撞过 11102。
+//
+// 判据（两条同时成立才剔除）：
+//
+//   - Blocked*2 >= Total：实证失败的账号数 **≥** 没试过的账号数（等价于 Blocked
+//     ≥ 过半）。不能要求"全员"——那正是我最初写的版本，生产上只能剔掉 4/13：
+//     负缓存覆盖面由 Handler.MaxRotate 决定（生产=3），一次失败尝试只写 3 个账号的
+//     条目，5 号池里永远凑不齐"全员"证据。而 11102 是**模型级**、与账号无关——
+//     2026-10-04 对命中 3/5 的模型逐个补测未命中的账号，**全部返回 11102，无一例外**
+//     （memory #857）。所以"过半数"已是足够证据，卡"全员"是把 MaxRotate 的
+//     实现细节当成了证据要求。
+//   - Healthy == 0：**没有任何账号成功用过它**（modelCost 只在成功路径写入、6h TTL
+//     内）。这是否决项——有一个反例就不剔。
+//
+// **注意不要加 `Available == 0`**：Healthy==0 时 Available ≡ Total-Blocked，所以
+// 要求 Available==0 等价于要求 Blocked==Total，即把判据退回"全员"、自相矛盾（我
+// 第一版就这么写的，被 TestModelsHidesUnavailableByMajorityEvidence 抓住）。真正
+// 放宽后的判据只看证据比例：Blocked*2 >= Total ⟺ Blocked >= Available。
+//
+// 为什么 Healthy==0 能兜住放宽带来的风险：上游将来若真做账号级权益分级，"部分账号
+// 能用"的模型一定有账号成功过 → Healthy>0 → 不剔。这条否决项把风险面收敛掉，
+// 所以放宽 Blocked 阈值是安全的。
+//
+// 剔除收益：三路 UA 并集让目录从 19 涨到 48，其中十来个是池内全号都跑不了的
+// （glm-4.6 / kimi-k2-thinking / minimax-m2.5 / deepseek-v3-1 ...）。列出来会让
+// 客户端模型发现选中一个必然失败的名字。
+//
+// 可恢复性：负缓存 TTL 到期（6h 起、指数退避至 24h 封顶）自动消失 → 模型回到目录；
+// 任何账号成功一次也会 BlockModelClear 立即解除。
+func (h *Handler) unavailableModelIDs() map[string]bool {
+	if h.cfg.Pool == nil {
+		return nil
+	}
+	ev := h.cfg.Pool.ModelUnavailableEvidenceAll("cn")
+	if len(ev) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(ev))
+	for model, e := range ev {
+		if e.Total == 0 {
+			continue
+		}
+		// 过半数账号有实证不可用（≥ ceil(Total/2)，即严格过半）。
+		if e.Blocked*2 < e.Total {
+			continue
+		}
+		if e.Healthy > 0 {
+			continue
+		}
+		out[model] = true
+	}
+	return out
+}
+
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
+	unavailable := h.unavailableModelIDs()
 	for _, mi := range h.fetchDynamicModels() {
+		// 池内全体账号都不可用 → 不列出（见 unavailableModelIDs 注释）。
+		if unavailable[mi.ID] {
+			continue
+		}
 		entry := map[string]any{
 			"id":       "cn:" + mi.ID,
 			"object":   "model",
@@ -514,7 +582,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 上游自然返回错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断
 	// 防御语义保留在读错误路径——移除预拦截后，截断只可能来自客户端自己断流，
 	// 读 body 出错就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
-	body, err := io.ReadAll(r.Body)
+	//
+	// readBody 而非 io.ReadAll：只对**读间空闲**设限（bodyIdleTimeout），不设总
+	// 时长。曾因 server.ReadTimeout=60s 把慢速上行（多图 base64 长上下文）误杀成
+	// 400「read body: i/o timeout」，生产实测见 cmd/server/http_server.go 注释。
+	body, err := readBodyWithTimeout(w, r, h.cfg.BodyReadTimeout)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
@@ -806,9 +878,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游超时 / 停滞：**不换号、不罚号**。
 			//
 			// 超时不是账号的问题：同一份请求换到别的号，撞上的是同一个慢上游，
-			// 只会把客户端拖到 MaxRotate × header_timeout（部署值 600s 时最坏
-			// 约半小时），期间还给一串健康号喂连败计数。此前全仓没有任何超时
-			// 识别，超时和"网络抖动"共用同一条换号路径。
+			// 只会把客户端拖到 MaxRotate × header_timeout（生产配置 120s 时最坏
+			// 约 6 分钟），期间还给一串健康号喂连败计数。修复前全仓没有任何超时
+			// 识别，超时和"网络抖动"共用同一条换号路径——生产归档里 4 次 503 的
+			// duration 精确为 125s（= 2×60s + 退避），正是被轮转放大的实证。
 			//
 			// 判定三态：net.Error.Timeout()（ResponseHeaderTimeout / Client.Timeout）、
 			// 显式 deadline（DeadlineExceeded / os.ErrDeadlineExceeded）、以及
@@ -908,11 +981,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 请求体解析失败（11101）：与 11115 / 图片无效同一哲学——同一 body 换任何
-			// 账号都是同样的解析结果，轮转只会放大无效请求（每号一次上游调用 +
-			// rotateBackoff 占用在途名额）。更要紧的是：继续轮转后末端会落到
-			// 「其余保持 503」，把确定失败的请求伪装成"账号不可用、稍后再试"，
-			// 客户端于是对必然失败的请求无限重试。立即透传上游原文回 400。
+			// 11101「Unmarshal chat params failed」：请求体解析失败，**在轮转循环内
+			// 立即 400 透传上游原文**，与 11115 / 图片无效同一哲学——同一 body 换
+			// 任何账号都是同样的解析结果，轮转只是把确定失败的请求放大成 N 次上游
+			// 调用 + rotateBackoff 占住在途名额。更要紧的是：继续轮转会让末端落到
+			// 「其余保持 503」，把确定失败伪装成"账号不可用、稍后再试"，客户端于是
+			// 对必然失败的请求无限重试。零动作（不冷却/不熔断/不 NoteError），
+			// applyErrorPolicy 的 ErrBadParams 分支只为文档完备。
 			if kind == upstream.ErrBadParams {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
@@ -945,8 +1020,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
 		// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核），
-		// 此前在读第一帧之前就 NoteSuccess + 清 11102 负缓存 + 绑粘性 → 被限流的号
+		// 若在读第一帧之前就 NoteSuccess + 清 11102 负缓存 + 绑粘性 → 被限流的号
 		// 记成健康、粘性把会话钉死在它身上，后续每一轮都打同一个限流号。
+		//
+		// 生产实证：2026-10-02 17:11:17 账号 28f60c37 撞 6004 后，流量立即迁到
+		// 6524c3d7（#2010/#2011）——迁移本身正确，但反过来的情形（error 帧在流
+		// 开始后才到）会把会话钉在限流号上。
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
@@ -1086,14 +1165,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		msg = "upstream timed out: rotation stopped (another account would hit the same slow upstream), please retry later"
 	}
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
-	// 错误（无上游原文）固定 no_healthy_account hint。
-	hint := upstream.NoHealthyAccountHint()
+	// 错误（无上游原文）默认固定 no_healthy_account hint —— 但**上游超时不是调度
+	// 错误**：它是"上游停摆、轮转已主动止损"（见 isUpstreamTimeout），此时说
+	// 「池中没有可用的健康账号」会把排查引向账号池，而真实原因是上游侧，且我们
+	// 一个账号都没罚（状态里 healthy、cooling 都是干净的）。故单独给一条 hint。
+	var ue *upstream.Error
 	// upstreamMsgPassed 记录 error.message 是否已被上游原文占据：模型级阻塞分支
 	// 据此决定要不要覆盖 msg（上游原文优先，含 requestId）。
 	upstreamMsgPassed := false
-	var ue *upstream.Error
-	if errors.As(lastErr, &ue) {
+	hint := upstream.NoHealthyAccountHint()
+	if errors.Is(lastErr, errUpstreamTimeout) {
+		hint = upstream.UpstreamTimeoutHint()
+	} else if errors.As(lastErr, &ue) {
 		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
+	}
+	if ue != nil {
 		switch ue.Kind {
 		case upstream.ErrSoftRate:
 			status = http.StatusTooManyRequests
@@ -1136,12 +1222,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if !upstreamMsgPassed {
 			msg = "model is unavailable on every account (per-model cooldown), try another model"
 		}
-		hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model", modelBlock.Count)
+		// 中文、且与 noHealthyHint 明确区分：这里要传达的是「换账号无用，请换模型」。
+		hint = fmt.Sprintf("%s%d 个账号被挡", upstream.ModelBlockedHint(), modelBlock.Count)
 		if !modelBlock.Until.IsZero() {
-			hint += "; earliest unblock at " + modelBlock.Until.Format(time.RFC3339)
-		}
-		if s := strings.TrimSpace(modelBlock.Reason); s != "" {
-			hint += "; upstream: " + s
+			hint += "；最早解封 " + modelBlock.Until.Format("01-02 15:04")
 		}
 		status = http.StatusBadRequest
 	}
@@ -1222,26 +1306,6 @@ func rotateBackoff(i int, ctx context.Context) bool {
 	return true
 }
 
-// errUpstreamTimeout 上游超时的哨兵：末端出口据此给出与「没号可用」可区分的文案。
-var errUpstreamTimeout = errors.New("upstream timeout")
-
-// isUpstreamTimeout 判断这一跳的失败是否属于「上游超时 / 停滞」。超时不是账号的
-// 问题，换号注定白换（同一份请求撞同一个慢上游），必须止损：不轮转、不罚号。
-// 三态判定见传输层错误分支的注释。
-func isUpstreamTimeout(err error, clientGone bool) bool {
-	if err == nil {
-		return false
-	}
-	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
-		return true
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
-		return true
-	}
-	return !clientGone && errors.Is(err, context.Canceled)
-}
-
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
 // kind 是唯一权威分类（来自 upstream.Classify / ChatStreamContext 的 *Error 信封），
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
@@ -1259,8 +1323,9 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
-//   - ErrBadParams → 不罚账号，且与 ErrPromptTooLong/ErrImageInvalid 同待遇：
-//     调用方在轮转循环内即刻 400 透传原文终止（换号必然同样失败）。
+//   - ErrBadParams → 11101 请求体解析失败：请求级错误（同 ErrPromptTooLong /
+//     ErrImageInvalid 待遇）。零动作，chatCompletions 已 fail-fast 直接 400
+//     透传原文，不轮转（换号必然同样失败）。
 //   - ErrPromptTooLong → 11115：请求的问题不是账号的问题。零动作（不冷却/不熔断/
 //     不 NoteError、不喂连败），chatCompletions 已直接透传原文返回不轮转。
 //   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
@@ -1353,10 +1418,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
-		// 有问题（网关侧不再截断，均为客户端畸形 JSON）。换了账号照样 400，
-		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；chatCompletions
-		// 已 fail-fast 400 透传原文、终止轮转——「换号可能有不同模型权限」属 11102
-		// （ErrModelBlocked）的分类域，与本类无关。
+		// 有问题（网关侧不再截断，均为客户端畸形 JSON）。零动作（不冷却/不熔断/
+		// 不 NoteError，同 ErrContentBlocked 待遇）。
+		//
+		// **不再轮转**：11101 发生在**上游解析请求体阶段**，还没走到模型路由，
+		// 所以「不同账号可能有不同模型权限」其实只是 11102（ErrModelBlocked）的
+		// 理由，那里已有 (账号,模型) 负缓存避让。chatCompletions 已在轮转循环内
+		// fail-fast 直接 400 透传原文，本分支只为文档完备（同 ErrPromptTooLong）。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
 		// （与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
@@ -1377,9 +1445,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // helpers
 // ---------------------------------------------------------------------------
 
+// writeJSON 输出 JSON 响应。
+//
+// 显式 no-store：网关响应对客户端而言是实时数据（尤其 /v1/models 会随上游目录与
+// 可用性筛选变化），URL 固定且无 ETag/Last-Modified —— 不设指令时浏览器或中间层
+// 可按启发式规则缓存，表现为「模型列表/可用性过期」。面板侧已在
+// panel.ServeHTTP 统一设置，这里是 server 包的对应出口。
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
 }

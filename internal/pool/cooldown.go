@@ -9,12 +9,19 @@ import (
 	"time"
 )
 
+// SetCredits 更新账号余额（credits 变更处）并**同步判定低积分冻结/自动解冻**：
+// 与 SetCreditsDetailed/ReenableIfCredits 同口径，两条余额刷新路径行为一致
+// （面板单号「余额」按钮走这里，用的是权威 UserResource 余额；此前不判冻结，
+// 会出现「余额已 >= 阈值但仍显示冻结」或「余额跌破阈值却不冻结」，
+// 且会写出 frozen=true 而 credits>=阈值 的不自洽 state.json，靠周期刷新才自愈）。
 func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
 		e.creditsTotal = total
+		// 权威余额已更新：低积分冻结/自动解冻跟随判定（见 checkFreezeLocked）。
+		p.checkFreezeLocked(e)
 		p.dirty.Store(true)
 	}
 }
@@ -95,6 +102,8 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, ea
 		e.creditsExpiring = expiring
 		e.creditsEarliestExpiry = earliestAt
 		e.creditsEarliestRemaining = earliestRemaining
+		// 权威余额已更新（签到/余额刷新）：低积分冻结/自动解冻跟随判定。
+		p.checkFreezeLocked(e)
 		p.dirty.Store(true)
 	}
 }
@@ -240,6 +249,16 @@ const (
 // 无此模型、重试无意义，只能换模型/换账号」。resetAt 无需传（11102 无重置文案），
 // ResetAt 保持零值，与 6004 台账共用 Until 判定——11102 条目会以 11102 reason 出现在
 // /status 台账，运维可见。
+// ModelUnavailableReasonPrefix 11102 负缓存条目的 reason 前缀（与
+// upstream.ModelBlockReason 同一字面量）。pool 不 import upstream（会成环），
+// 所以在本包声明一份；两者一致性由 pool 测试断言守住。
+const ModelUnavailableReasonPrefix = "11102"
+
+// IsModelUnavailableReason 报告该条目是否属 11102「模型不可用」类（区别于 6004 限流）。
+func IsModelUnavailableReason(reason string) bool {
+	return strings.HasPrefix(reason, ModelUnavailableReasonPrefix)
+}
+
 func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if uid == "" || model == "" {
 		return

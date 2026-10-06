@@ -584,9 +584,9 @@ func Classify(status int, body string) ErrKind {
 		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
 		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
 		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
-		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
-		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
+		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转** —— 11101 发生在上游
+		// 解析请求体阶段，还没走到模型路由，所以「不同账号可能有不同模型权限」其实
+		// 是 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
 		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
 			return ErrBadParams
 		}
@@ -1186,10 +1186,9 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 //   - tags 含生成类标签（图片/视频）：生成模型走各自专用端点，作为对话模型
 //     选上去只会报 11102，非本网关用途。
 //
-// 生成类标签随上游扩充：早期只有 text-to-image，桌面端目录（2026-10-02 实测）
-// 另有 text-to-video / image-to-video（seedance 系列）与 image-to-image
-// （gpt-image 系列）——后者已由 text-to-image 覆盖，此处补齐视频两类。
-// 注意本函数 CN 与 global 共用，新增标签对两域同时生效。
+// 生成类标签随上游扩充：早期只有 text-to-image，上游桌面端目录（2026-10-02 实测，
+// 上游 PR #107）另有 text-to-video / image-to-video（seedance 系列），此处一并过滤。
+// 本函数 CN 与 global 共用，新增标签对两域同时生效。
 func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	id = strings.ToLower(strings.TrimSpace(id))
 	for _, p := range [...]string{"nes-", "completion-", "codewise-"} {
@@ -1200,8 +1199,9 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	if maxOutputTokens > 0 && maxOutputTokens <= 256 {
 		return true
 	}
+	// 生成类标签：图片与视频（视频两类来自上游 PR #107）。
 	for _, t := range tags {
-		switch t {
+		switch strings.ToLower(strings.TrimSpace(t)) {
 		case "text-to-image", "image-to-image", "text-to-video", "image-to-video":
 			return true
 		}
@@ -1392,13 +1392,48 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
 // 失败返回错误（调用方降级为仅企业端点）。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
+	// 单路探测：只用官方 IDE UA，与官方网关行为一致。
+	//
+	// 官方 CN 的 19 个模型 = **两路并集**（2026-10-04 实测核对）：
+	//   /v3/config (IDE UA) 的可聊子集 13 个
+	//   ∪ /console/enterprises/personal/models 的 agents[cli] 17 个
+	//   = 19（重叠 11）；企业端点独有 6 个：glm-5v-turbo / hy4-preview /
+	//   kimi-k2.6 / kimi-k2.7 / kimi-k2.8-preview / space-bunny
+	// 上面 fetchV3Models 只负责 v3 那 13 个；剩下 6 个由 FetchModels 的
+	// mergeModelInfos(v3.infos, enterprise.infos) 补齐。两路探查在 FetchModels
+	// 里并发发起，企业端点走**配置的**出站 UA（生产 = 桌面端三段式）。
+	// v3 面取全量 models（不按 agents[cli] 过滤，与 global 探测口径一致）。
+	//
+	// 历史：2026-10-04 白天曾改为三路并发（IDE + 桌面端 + CLI）取并集，目录 19→48
+	// 以修 issue #43/#102/#26/#15 的「目录不全」。当晚回退，依据是隔离实例实测
+	// （5 个真实账号、真实余额、逐条 max_tokens=5 调用，详见 CHANGELOG wb9）：
+	//
+	//	只留 IDE   目录 19  可用 14/14（100%）
+	//	IDE + CLI  目录 38  可用 25
+	//	三路并集   目录 48  可用 36（75%）
+	//
+	// 三路并集虽多出 22 个可用模型，但目录里必然混入 12 个「任何 UA、任何账号都
+	// 报 11102」的条目：glm-4.6 / glm-4.6v / glm-4.7 / glm-5.0 / kimi-k2-thinking /
+	// kimi-k2-instruct-taiji / minimax-m2.5 / default-1.1 / default-1.2 /
+	// deepseek-v3-1-volc / deepseek-r1-0528 / hunyuan-image-alpha-edit。A/B 已排除
+	// 聊天出站 UA 的影响（同一份 state，聊天 UA 换成 IDE 与换成桌面端，这 12 个
+	// 逐条结果完全相同）——它们是账号权益问题，不是身份问题，换 UA 救不了。
+	//
+	// 决策：对齐官方，只列官方 IDE 目录，不引入会必然 503 的条目。
+	// 注：desktopUA 常量保留——/v2/report 等桌面行为上报仍需它（见 desktop.go）。
 	byID, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]ModelInfo, 0, len(byID))
-	for _, mi := range byID {
-		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids) // map 遍历无序：排序保证目录输出稳定
+	for _, id := range ids {
+		mi := byID[id]
+		if mi.ID == "" || nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
 			continue
 		}
 		out = append(out, mi)
@@ -1933,15 +1968,38 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 	return t, true
 }
 
+// packageExpiry 从上游套餐字段解析「真失效时刻」，语义与 CreditPackages 的
+// switch 逐条对齐（口径分散在两条路径上正是 issue #23 / #101 的成因）：
+//
+//  1. DeductionEndTime（epoch 毫秒）优先 —— 可抵扣窗口结束，即「这个包什么时候
+//     不能再花」。这才是「用不完就没了」的判据；CycleEndTime 只是周期边界
+//     （额度重置点），上游实测两者不等（如某包 CycleEndTime=2026-10-31 23:59、
+//     DeductionEndTime=2026-11-02 22:35）。
+//  2. 回落到 CycleEndTime 字符串（UTC+8 墙钟）。
+//
+// 两条都拿不到（或 DeductionEndTime 为 0/负）时返回 false，调用方保守地不把该包
+// 计入到期路由 —— 宁可漏标，不可错标成快过期而让钱包插队。
+//
+// 时区：epoch 毫秒是绝对时刻，直接 UnixMilli；字符串按 softRateResetLoc(UTC+8)
+// 解析，与上游文案同口径。
+func packageExpiry(deductionEndMs int64, cycleEnd string) (time.Time, bool) {
+	if deductionEndMs > 0 {
+		return time.UnixMilli(deductionEndMs), true
+	}
+	return parsePackageEndTime(cycleEnd)
+}
+
 // UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
-// soon > 0 且套餐 CycleEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
+// soon > 0 且套餐到期时刻解析成功且 ≤ now+soon 的余额计入 expiring
 // （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
 // 恒 0（禁用分桶，行为与引入前一致）。expiring 是 remain 的一部分。
 //
-// 到期时间判据是 CycleEndTime（上游实测：CN/global 两域字段全集均无 PackageEndTime，
-// 旧判据恒 miss 致 expiring 恒 0；CycleEndTime 是上游真实下发的到期时刻——
-// global Bonus Pack 14 天赠送积分的到期时间即此字段）。解析失败/缺失的套餐保守
-// 不计入 expiring（不误标为快过期而插队）。
+// 到期时间判据统一走 packageExpiry：优先 DeductionEndTime（可抵扣窗口结束，真失效
+// 时刻），回落 CycleEndTime（周期边界）。历史备注保留于此——上游实测 CN/global 两域
+// 字段全集**均无** PackageEndTime，旧判据恒 miss 致 expiring 恒 0；而读 CycleEndTime
+// 又会把「周期重置点」当成到期时刻，与面板口径（CreditPackages 已用 DeductionEndTime）
+// 分裂，正是 issue #23「临期资源包优先级并未提高」的根因，本路径此前未修。
+// 两条都解析失败的套餐保守不计入 expiring（不误标为快过期而插队）。
 // 单套餐取数统一调 packageRemainUsed（与 CreditPackages 同一事实来源，含 remain
 // 钳 [0,size] 与 used 修正；消除双份逻辑漂移——旧中间 switch 只钳负值，上游脏数据
 // CycleRemain>Size 时会高估）。
@@ -1979,13 +2037,21 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 			Data struct {
 				Accounts []struct {
 					PackageName         string `json:"PackageName"`
-					CycleEndTime        string `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
 					CapacitySize        int64  `json:"CapacitySize"`
 					CapacityRemain      int64  `json:"CapacityRemain"`
 					CapacityUsed        int64  `json:"CapacityUsed"`
 					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
 					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
 					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+					// DeductionEndTime 可抵扣窗口结束（epoch 毫秒）——「这个包什么时候
+					// 不能再花」的真失效时刻，语义与 CreditPackages 处同一字段完全一致
+					// （见那里的长注释）。此前本路径只读 CycleEndTime，而 CycleEndTime 是
+					// **周期边界**（额度重置点），不是到期时刻 —— 上游实测两个字段不等
+					// （如某包 CycleEndTime=2026-10-31 23:59、DeductionEndTime=2026-11-02
+					// 22:35），用前者会把快到期的包误判成晚到期，issue #23 的根因之一。
+					DeductionEndTime int64 `json:"DeductionEndTime"`
+					// CycleEndTime 周期边界（"2006-01-02 15:04:05"），仅作回落。
+					CycleEndTime string `json:"CycleEndTime"`
 				} `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
@@ -2013,7 +2079,7 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 		if r <= 0 {
 			continue
 		}
-		end, ok := parsePackageEndTime(acct.CycleEndTime)
+		end, ok := packageExpiry(acct.DeductionEndTime, acct.CycleEndTime)
 		if !ok || !end.After(now) {
 			continue
 		}

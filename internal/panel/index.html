@@ -180,11 +180,11 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
 .stats {
-  display: grid; grid-template-columns: repeat(6, 1fr);
+  display: grid; grid-template-columns: repeat(7, 1fr);
   border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
   overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
 }
-@media (max-width: 980px) { .stats { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 980px) { .stats { grid-template-columns: repeat(4, 1fr); } }
 @media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
 .stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
@@ -231,7 +231,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* 模型表：紧凑一些，7 列在常见窗口下尽量免横向滚动 */
 .acc.md { min-width: 700px; }
 .acc.md th, .acc.md td { padding: 10px 9px; }
-.who { min-width: 118px; max-width: 200px; }
+.who { min-width: 118px; max-width: 144px; }
 #taskTable .who { max-width: 360px; }
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -241,7 +241,14 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.usage-cell { min-width: 268px; }
+.usage-cell { min-width: 240px; }
+/* 窄窗口（≤1400px）：用量列隐藏即时速度（tok/s，四个指标里最次要的）并放开
+   min-width，把横向空间让给动作列按钮——配合 .acts 的 flex-wrap，
+   修复「新增按钮后右侧显示不全」（1440 以下禁用/移除被裁切）。 */
+@media (max-width: 1400px) {
+  .usage-cell { min-width: 0; }
+  .usage-item.usage-rate { display: none; }
+}
 .usage-line {
   display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
   font: 600 11.5px/1.25 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap;
@@ -284,8 +291,19 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .rate-limit.model-unavailable { border-color: var(--line); background: var(--surface-2); color: var(--ink-3); }
 .rate-limit b { color: var(--ink); font-family: var(--mono); font-weight: 600; }
 .rate-limit span { color: var(--ink-2); }
-.acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
-.acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
+/* 动作列按钮多（签到/余额/任务/阈值/解冻|禁用/移除）。宽屏一行 6 个；
+   窗口 ≤1500px 时列宽不足，此前右侧按钮被裁切（禁用/移除看不到）——
+   窄屏改换行展示全部按钮，固定列宽 148px（3 按钮/行 + padding 22）保证
+   不被表格算法压成一列竖排。 */
+.acts { display: flex; gap: 4px; justify-content: flex-end; white-space: nowrap; }
+.acts button { padding: 3.5px 6px; font-size: 12.5px; white-space: nowrap; flex: none; }
+@media (max-width: 1500px) {
+  .acc .acts { flex-wrap: wrap; width: 148px; }
+}
+@media (max-width: 1240px) {
+  /* 更窄窗口：账号列再收窄，动作列按钮不被挤出容器（1200 下曾差 16px）。 */
+  .who { max-width: 120px; }
+}
 
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
 .empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
@@ -521,6 +539,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   }
   .fbar > input[type=search] { min-width: 200px; flex: 0 1 280px; }
   .fbar > input[type=search]::-webkit-search-cancel-button { cursor: pointer; }
+  /* #105：模型搜索框被包进独立 form 以避开 Chromium 的密码框启发式（详见
+     index.html 该处注释）。form 本身必须对布局零影响——display:contents 让它
+     把自己"消失"，子 input 仍作为 .fbar 的 flex 成员参与排布。 */
+  /* 当前不可用的模型行（#11102 池内全号命中）：降饱和但不隐藏——面板要保留
+     可见性（运维需知道"上游有这个模型但当前用不了"），只是视觉上区别于可用行。 */
+  tr.md-unavail .nm { color: var(--ink-3); }
+  tr.md-unavail .id, tr.md-unavail .num { opacity: .62; }
+  .fbar > form.md-filter-form { display: contents; }
+  .fbar > form.md-filter-form > input[type=search] {
+    width: auto; padding: 5px 10px; font-size: 12.5px; border-radius: 6px;
+    min-width: 200px; flex: 0 1 280px;
+  }
+  .fbar > form.md-filter-form > input[type=search]::-webkit-search-cancel-button { cursor: pointer; }
   .fbar .grow { flex: 1; }
   .fbar .flab { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
   .fbar select { cursor: pointer; }
@@ -643,6 +674,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
         <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
+        <div class="stat warn"><div class="v" id="sFrozen">-</div><div class="k">低积分冻结</div></div>
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
@@ -739,7 +771,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnModels">重新获取</button>
         </header>
         <div class="fbar" id="mdFilter">
-          <input id="mdQ" type="search" placeholder="搜索模型 ID / 名称 / 描述 / 厂商" aria-label="搜索模型">
+          <!-- #105：这一对"用户名字段 + 密码字段"必须放在独立容器里，否则
+               Chromium 的启发式会把 mdQ 当成用户名输入框，弹出"保存的密码"下拉
+               （自动填充会直接把用户名填进搜索框，模型列表被过滤成空）。
+               修法与上游 PR #106 同思路：用 form + autocomplete 语义把两者拆开——
+               一个带 autocomplete="off" 的 form 包住搜索框，明确声明它不是登录表单。 -->
+          <form class="md-filter-form" autocomplete="off" onsubmit="return false">
+            <input id="mdQ" type="search" placeholder="搜索模型 ID / 名称 / 描述 / 厂商" aria-label="搜索模型" autocomplete="off" name="mdq-not-credential">
+          </form>
           <select id="mdRealm" aria-label="按域筛选">
             <option value="">全部域</option>
             <option value="cn">国内版 CN</option>
@@ -1242,7 +1281,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
     </header>
     <div class="body">
-      <form style="display:contents" onsubmit="return false"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
+      <!-- #105：显式声明这是独立登录表单（form + autocomplete 语义），
+           避免 Chromium 在页面里"找用户名框"时把模型搜索框 mdQ 配对进来。 -->
+      <form autocomplete="on" onsubmit="return false">
+        <input type="password" id="keyInput" placeholder="api_key" autocomplete="current-password" name="wb2api_key">
+      </form>
       <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
     </div>
     <footer>
@@ -1254,6 +1297,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <div id="toasts"></div>
 
-<script src="app.js"></script>
+<script src="{{APP_JS}}"></script>
 </body>
 </html>

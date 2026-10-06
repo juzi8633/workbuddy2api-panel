@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
+	"sync"
 )
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
@@ -159,6 +160,27 @@ func clampGPTMinMaxTokens(obj map[string]any) {
 // effortRank 档位从低到高。
 var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
 
+// effortRewriteLogged 记录「本进程内已打印过」的 reasoning_effort 改写组合。
+//
+// 为什么需要：降档是**按模型能力**决定的，档位组合是有限的小集合（实测生产
+// deepseek-v4.1-flash + claude-cli 固定发 medium，13 小时里 1368 行日志全是同一句
+// `medium -> low`）。每请求一行会把 journal 淹掉——请求行被挤到看不见，排查真问题
+// 时得先翻过几千行噪音。
+//
+// 去重键是「模型 + 请求档 + 实际档 + 方向」，所以：换模型、换档位、或档位映射变化
+// （上游调整 supportedEfforts）都会重新打印一次——**有信息量的变化一条都不会丢**，
+// 丢掉的只有同一组合的重复。同组合首次出现必然打印，不存在"静默改写"。
+var effortRewriteLogged sync.Map
+
+// logEffortRewriteOnce 每个「模型+请求档+实际档+方向」组合只打印一次。
+func logEffortRewriteOnce(kind, model, from, to string) {
+	key := kind + "|" + model + "|" + from + "|" + to
+	if _, loaded := effortRewriteLogged.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	log.Printf("reasoning_effort %s model=%s %s -> %s（同组合本进程内只打印一次）", kind, model, from, to)
+}
+
 // normalizeReasoningEffort 按模型 supportedEfforts 降级 reasoning_effort（snake/camel 双字段兼容）。
 //   - 请求档位模型支持 → 原样透传
 //   - 请求档位不支持 → 改为 ≤请求档位的最高支持档（降级）
@@ -204,7 +226,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if best != "" {
 		if !strings.EqualFold(best, reqStr) {
 			obj[key] = best
-			log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
+			logEffortRewriteOnce("downgraded", model, reqStr, best)
 		}
 		return
 	}
@@ -218,7 +240,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	}
 	if lowest != "" {
 		obj[key] = lowest
-		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
+		logEffortRewriteOnce("floored", model, reqStr, lowest)
 	}
 }
 

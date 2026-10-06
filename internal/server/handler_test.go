@@ -137,8 +137,9 @@ func TestChatLargeBodyNoGatewayLimit(t *testing.T) {
 }
 
 // TestChatBadParamsFailsFastWithoutPenalty 上游 400 + Unmarshal chat params failed（11101）
-// → 请求级错误：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），**且不轮转**——
-// 同一 body 换号必然同样失败。端到端断言只打一次上游、直接回 400、账号完好。
+// → 请求级错误（issue #99）：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），
+// **且不轮转** —— 11101 发生在上游解析请求体阶段，还没走到模型路由，同一 body
+// 换任何账号都是同样的解析结果。端到端断言只打一次上游、直接回 400、账号完好。
 func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -168,7 +169,8 @@ func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 }
 
 // TestChatBadParams400CarriesUpstreamBody 11101 的 400 响应必须包含上游原始
-// 11101 信息（含 requestId，客户端据此排查），且不再出现空洞的 no_healthy_account。
+// 11101 信息（含 requestId，客户端据此排查），且不再出现空洞的 no_healthy_account
+// ——确定失败的请求被伪装成"账号不可用"会让客户端无限重试（issue #99 的动机）。
 func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, false
@@ -869,6 +871,31 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 }
 
+// 网关 JSON 响应必须显式禁缓存：URL 固定、无 ETag/Last-Modified，/v1/models 的
+// 内容还会随上游目录与可用性筛选变化（不缓存才对）。面板侧在 panel.ServeHTTP
+// 统一设置，这里是 server 包出口的对应契约。覆盖正常 200 与 OpenAI 格式错误响应。
+func TestGatewayResponsesDisabledCaching(t *testing.T) {
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"models 200", "GET", "/v1/models", ""},
+		{"错误响应（非法 JSON）", "POST", "/v1/chat/completions", "{not json"},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(c.method, c.path, strings.NewReader(c.body))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(rec, req)
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("%s (%s %s): Cache-Control=%q want no-store", c.name, c.method, c.path, cc)
+		}
+	}
+}
+
 func TestModelsDynamic(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()
@@ -1008,7 +1035,7 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
 
-	var calls atomic.Int32 // FetchModels 企业/v3 两路并发探测回调，计数须原子
+	var calls atomic.Int32 // FetchModels 探测回调（企业端点 1 路 + /v3/config 的 IDE UA 1 路），计数须原子
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls.Add(1)
 		return 500, `boom`, false
@@ -1025,9 +1052,10 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 			t.Fatalf("req %d: code=%d body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	// 一轮探测 = 2 次上游调用（企业端点 + /v3/config 并发，两路全失败才进负缓存）。
+	// 一轮探测 = 2 次上游调用：企业端点 1 次 + /v3/config 的 IDE UA 1 次
+	// （wb9 起目录探测只走官方 IDE 一路，见 fetchV3Models 注释），全部失败才进负缓存。
 	if got := calls.Load(); got != 2 {
-		t.Errorf("want 2 probes (console + v3), got %d", got)
+		t.Errorf("want 2 probes (console + v3/config IDE UA), got %d", got)
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
@@ -1566,5 +1594,148 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 	}
 	if systemCount != 1 {
 		t.Errorf("want exactly 1 system message, got %d (all=%v)", systemCount, msgs)
+	}
+}
+
+// TestModelAvailabilityReasonPrefixMatchesUpstream 守卫 pool 与 upstream 两处
+// 11102 reason 字面量一致：pool 不 import upstream（会成环），所以在 pool 里复制了
+// 一份前缀常量。两处一旦漂移，/v1/models 的剔除会静默失效（条目还在负缓存里但
+// 判定不认）。本测试在能同时引用两者的包里断言相等。
+func TestModelAvailabilityReasonPrefixMatchesUpstream(t *testing.T) {
+	if !strings.HasPrefix(upstream.ModelBlockReason, pool.ModelUnavailableReasonPrefix) {
+		t.Fatalf("pool.ModelUnavailableReasonPrefix=%q must prefix upstream.ModelBlockReason=%q",
+			pool.ModelUnavailableReasonPrefix, upstream.ModelBlockReason)
+	}
+	if !pool.IsModelUnavailableReason(upstream.ModelBlockReason) {
+		t.Fatalf("IsModelUnavailableReason(%q) must be true", upstream.ModelBlockReason)
+	}
+	// 6004 限流理由不得被判成"模型不可用"。
+	if pool.IsModelUnavailableReason("6004 模型限流") {
+		t.Error("6004 rate-limit reason must not be classified as model-unavailable")
+	}
+}
+
+// TestModelsHidesUnavailableByMajorityEvidence 放宽后的判据：**过半数**账号有
+// 11102 实证 + 无账号成功过 + 当前选不到 → 剔除。
+//
+// 背景：旧的"全员命中"判据在生产上只能剔掉 4/13，因为负缓存覆盖面由 MaxRotate=3
+// 决定（一次尝试只写 3 个账号）。而 11102 是模型级（补测未命中账号全部 11102），
+// 所以"过半数"已是足够证据。
+func TestModelsHidesUnavailableByMajorityEvidence(t *testing.T) {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = []upstream.ModelInfo{
+		{ID: "dead-model", Name: "Dead", ContextWindow: 131072, MaxTokens: 8192},
+		{ID: "half-blocked", Name: "Half", ContextWindow: 131072, MaxTokens: 8192},
+		{ID: "alive", Name: "Alive", ContextWindow: 131072, MaxTokens: 8192},
+	}
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+	defer func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.Unlock()
+	}()
+
+	p := pool.New("")
+	for _, uid := range []string{"u1", "u2", "u3", "u4", "u5"} {
+		p.Add(&auth.Auth{UID: uid, AccessToken: "at", ExpiresAt: 9999999999})
+	}
+	// dead-model：3/5 过半数实证（模拟 MaxRotate=3 留下的证据）→ 剔除。
+	for _, uid := range []string{"u1", "u2", "u3"} {
+		p.BlockModelBackoff(uid, "dead-model", upstream.ModelBlockReason)
+	}
+	// half-blocked：3/5 实证，但 u4 成功过 → Healthy>0 → **否决**，保留。
+	for _, uid := range []string{"u1", "u2", "u3"} {
+		p.BlockModelBackoff(uid, "half-blocked", upstream.ModelBlockReason)
+	}
+	p.NoteModelCost("u4", "half-blocked", 0.1, 100)
+
+	h := NewHandler(Config{Pool: p, Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, sseOK, true
+	})})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	var resp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, m := range resp.Data {
+		got[m.ID] = true
+	}
+	if got["cn:dead-model"] {
+		t.Error("过半数实证 + 无人成功过 → 必须剔除")
+	}
+	if !got["cn:half-blocked"] {
+		t.Error("有账号成功过（Healthy>0）→ 必须保留（否决项）")
+	}
+	if !got["cn:alive"] {
+		t.Error("从未被撞过的模型必须保留")
+	}
+}
+
+// TestModelsHidesPoolWideUnavailable 全员命中 + 无人可用 → 剔除（旧判据场景仍成立）。
+func TestModelsHidesPoolWideUnavailable(t *testing.T) {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = []upstream.ModelInfo{
+		{ID: "glm-5.2", Name: "GLM-5.2", ContextWindow: 131072, MaxTokens: 8192},
+		{ID: "glm-4.6", Name: "GLM-4.6", ContextWindow: 168000, MaxTokens: 32000},
+		{ID: "kimi-k2-thinking", Name: "Kimi", ContextWindow: 256000, MaxTokens: 32768},
+	}
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+	defer func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.Unlock()
+	}()
+
+	p := pool.New("")
+	// 4 个账号：这样"1/4 命中"才是不足半数（2 号池里 1/2 恰好过半 → 会剔除）。
+	for _, uid := range []string{"u1", "u2", "u3", "u4"} {
+		p.Add(&auth.Auth{UID: uid, AccessToken: "at-" + uid, ExpiresAt: 9999999999})
+	}
+	// u1+u2 撞 glm-4.6（2/4 = 恰好过半）→ 剔除。
+	p.BlockModelBackoff("u1", "glm-4.6", upstream.ModelBlockReason)
+	p.BlockModelBackoff("u2", "glm-4.6", upstream.ModelBlockReason)
+	// 只有 u1 撞 kimi（1/4，不足半数）→ 保留。
+	p.BlockModelBackoff("u1", "kimi-k2-thinking", upstream.ModelBlockReason)
+
+	h := NewHandler(Config{Pool: p, Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, sseOK, true
+	})})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	var resp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, m := range resp.Data {
+		got[m.ID] = true
+	}
+	if got["cn:glm-4.6"] {
+		t.Error("pool-wide unavailable model must be hidden")
+	}
+	if !got["cn:kimi-k2-thinking"] {
+		t.Error("model with a healthy account must stay listed")
+	}
+	if !got["cn:glm-5.2"] {
+		t.Error("never-blocked model must stay listed")
 	}
 }

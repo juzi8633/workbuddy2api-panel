@@ -123,7 +123,15 @@ func (p *Pool) load() {
 		return
 	}
 	var sf stateFile
-	if json.Unmarshal(raw, &sf) != nil {
+	if err := json.Unmarshal(raw, &sf); err != nil {
+		// **必须打日志**：解析失败会丢弃**整个** state 文件（余额、模型冷却、
+		// 成本台账全没），而只读文件的入口（os.ReadFile）本身没有错误。
+		// 典型成因（实测 2026-10-04）：某个时间字段是"无时区"的 naive 形式
+		// （"2026-10-04T17:30:00.123456"），time.Time.UnmarshalJSON 直接报错 →
+		// json.Unmarshal 整体失败。此前静默 return，日志只留下正常的
+		// "恢复来源=本地 state.json"，运维完全看不出状态已被清空。
+		log.Printf("WARN: pool: state.json 解析失败，本次**丢弃全部持久化状态**（余额/模型冷却/成本台账）: %v（文件 %s，%d 字节）",
+			err, p.stateFp, len(raw))
 		return
 	}
 	p.applyAccountsLocked(sf.Accounts)
@@ -150,17 +158,23 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			disabled:                 s.Disabled,
 			paused:                   s.Paused,
 			reason:                   s.Reason,
-			until:                    s.Until,
-			coolKind:                 s.CoolKind,
-			successCount:             s.SuccessCount,
-			errTotal:                 errTotal,
-			lastErr:                  s.LastErr,
-			lastSuccess:              s.LastSuccess,
-			lastCheckinDay:           s.LastCheckinDay,
-			tokenUsage:               s.TokenUsage,
-			softStreak:               s.SoftStreak,
-			sessionDeadFails:         s.SessionDeadFails,
-			consecutiveFails:         s.ConsecutiveFails,
+			// 低积分自动冻结：阈值/冻结态/原因原样恢复（旧 state.json 缺字段 → 零值，
+			// 即"未开启、未冻结"，与旧版加载行为零差异）。冻结号重启后不重新参与选号，
+			// 直到下一次余额刷新（ReenableIfCredits/SetCreditsDetailed）或 Revive。
+			freezeThreshold:  s.FreezeThreshold,
+			frozen:           s.Frozen,
+			frozenReason:     s.FrozenReason,
+			until:            s.Until,
+			coolKind:         s.CoolKind,
+			successCount:     s.SuccessCount,
+			errTotal:         errTotal,
+			lastErr:          s.LastErr,
+			lastSuccess:      s.LastSuccess,
+			lastCheckinDay:   s.LastCheckinDay,
+			tokenUsage:       s.TokenUsage,
+			softStreak:       s.SoftStreak,
+			sessionDeadFails: s.SessionDeadFails,
+			consecutiveFails: s.ConsecutiveFails,
 		}
 		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 		if e.creditsExpiring < 0 {
@@ -175,6 +189,14 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if e.creditsEarliestRemaining == 0 || e.creditsEarliestExpiry.IsZero() || !now.Before(e.creditsEarliestExpiry) {
 			e.creditsEarliestExpiry = time.Time{}
 			e.creditsEarliestRemaining = 0
+		}
+		// 幂等对账（历史脏数据自愈）：冻结态与（阈值, 余额）矛盾时不恢复冻结。
+		// 阈值关闭（<=0）或余额已达阈值却仍 frozen，是旧版单号余额刷新路径（SetCredits
+		// 不判冻结）写出的不自洽状态；恢复侧做一次对账，避免脏状态跨重启永久保留。
+		// 依赖同一不变式的合法场景不受影响：threshold>0 且 credits<threshold 的冻结照常恢复。
+		if e.frozen && (e.freezeThreshold <= 0 || e.credits >= e.freezeThreshold) {
+			e.frozen = false
+			e.frozenReason = ""
 		}
 		// 熔断器持久化恢复：breakerUntil 未过期才恢复（过期不复活），retryCount 仅在
 		// 熔断仍有效时保留（否则归零，不保留无用退避指数）。
@@ -195,7 +217,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if e.modelCooldowns == nil {
 					e.modelCooldowns = map[string]modelCooldown{}
 				}
-				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, Hits: mc.Hits, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
@@ -303,6 +325,11 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			CreditsExpiring:          e.creditsExpiring,
 			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 			CreditsEarliestRemaining: e.creditsEarliestRemaining,
+			// 低积分自动冻结：阈值/冻结态/原因直接落盘（三者均 omitempty，未开启
+			// 该功能的账号不新增字段）。
+			FreezeThreshold: e.freezeThreshold,
+			Frozen:          e.frozen,
+			FrozenReason:    e.frozenReason,
 		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
@@ -324,7 +351,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				if s.ModelCooldowns == nil {
 					s.ModelCooldowns = map[string]stateModelCooldown{}
 				}
-				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, Hits: mc.Hits, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。

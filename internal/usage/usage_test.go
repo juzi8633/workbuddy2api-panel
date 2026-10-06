@@ -353,3 +353,48 @@ func TestCacheTokensPersistRoundtrip(t *testing.T) {
 		t.Fatalf("恢复后 cache_hit_rate=%v want 75", snap.CreditByModel[0].CacheHitRate)
 	}
 }
+
+// TestSeriesCarriesPerBucketCredits 时序点必须带出**逐桶**的积分观测（issue #58：
+// 「用量界面看积分扣除历史」）。断言三件事：
+//   - 有 credit 的桶，Credits 与 CreditSamples 都落在对应 Point 上；
+//   - 没 credit 观测的桶，CreditSamples=0（前端据此断开曲线，而不是画成"扣了 0 分"）；
+//   - 二者在同一序列里共存时不会互相污染（逐桶独立，不是全局均摊）。
+func TestSeriesCarriesPerBucketCredits(t *testing.T) {
+	r := New("")
+	base := time.Now().Truncate(time.Hour).Add(-4 * time.Hour)
+	// h0：无 credit 观测（上游没回 usage.credit）
+	r.Add(base, "cn", "u", "m", Delta{PromptTokens: 100, HasPromptTokens: true}, true)
+	// h1：观测到 2.5 分 / 500 token
+	r.Add(base.Add(time.Hour), "cn", "u", "m",
+		Delta{TotalTokens: 500, HasTotal: true, Credit: 2.5, HasCredit: true}, true)
+	// h2：观测到 0 分（明确免费 —— HasCredit=true 但值为 0，与"没观测到"不同）
+	r.Add(base.Add(2*time.Hour), "cn", "u", "m",
+		Delta{TotalTokens: 300, HasTotal: true, Credit: 0, HasCredit: true}, true)
+
+	s := r.Snapshot(0, nil)
+	if len(s.Series) != 3 {
+		t.Fatalf("series=%d want 3", len(s.Series))
+	}
+	byScope := map[string]Point{}
+	for _, p := range s.Series {
+		byScope[p.T] = p
+	}
+	h0 := byScope[base.Format("2006-01-02T15")]
+	h1 := byScope[base.Add(time.Hour).Format("2006-01-02T15")]
+	h2 := byScope[base.Add(2*time.Hour).Format("2006-01-02T15")]
+
+	if h0.CreditSamples != 0 || h0.Credits != 0 {
+		t.Errorf("无观测的桶必须 samples=0/credits=0，got %d/%v", h0.CreditSamples, h0.Credits)
+	}
+	if h1.CreditSamples != 1 || h1.Credits != 2.5 || h1.CreditTokens != 500 {
+		t.Errorf("有观测的桶 = %d/%v/%d want 1/2.5/500", h1.CreditSamples, h1.Credits, h1.CreditTokens)
+	}
+	// 「明确 0 分」也是观测：samples=1、credits=0 —— 前端据此画 0 而不是断开。
+	if h2.CreditSamples != 1 || h2.Credits != 0 {
+		t.Errorf("明确 0 分的桶必须 samples=1/credits=0，got %d/%v", h2.CreditSamples, h2.Credits)
+	}
+	// totals 是三者之和：2.5+0，样本数 2（h0 不计）。
+	if s.Totals.Credits != 2.5 || s.Totals.CreditSamples != 2 {
+		t.Errorf("totals = %v/%d want 2.5/2", s.Totals.Credits, s.Totals.CreditSamples)
+	}
+}
