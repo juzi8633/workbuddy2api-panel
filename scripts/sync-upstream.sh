@@ -4,7 +4,9 @@ set -euo pipefail
 # Only our fork is writable. The upstream is exclusively a fetch source.
 fork_url='https://github.com/juzi8633/workbuddy2api-panel.git'
 upstream_url='https://github.com/linguo2625469/workbuddy2api-panel.git'
-if [[ "$(git remote get-url --push --all origin)" != "$fork_url" ]]; then
+push_urls="$(git remote get-url --push --all origin)"
+# actions/checkout uses the canonical URL without a .git suffix.
+if [[ "$push_urls" != "$fork_url" && "$push_urls" != "${fork_url%.git}" ]]; then
   echo 'Refusing sync: origin push URL must be our fork.' >&2
   exit 1
 fi

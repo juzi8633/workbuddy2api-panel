@@ -4,6 +4,8 @@
 
 <h1 align="center">WorkBuddy2API Panel</h1>
 
+本分支以 [juzi8633/workbuddy2api-panel](https://github.com/juzi8633/workbuddy2api-panel) 为准，包含我们的 `wb17` 累计修改。只向本仓库提交代码；上游只用于读取和同步，不向上游提交修改或 PR。每天北京时间 03:23 自动合并上游，冲突或检查失败时停止推送。详见 [FORK_POLICY.md](FORK_POLICY.md) 和 [CHANGELOG.md](CHANGELOG.md)。
+
 <p align="center">
   <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
   Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · 流式 / 非流式
