@@ -477,10 +477,6 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	return StreamHint(w, r, nil)
 }
 
-// StreamHint 同 Stream，但上游 error 帧透出前把 hintFn(payload) 的返回值写入
-// error.gateway_hint。hintFn 为 nil 或返回空串 → 原样透传（零改写）。
-// 空流兜底 error 帧（"empty upstream stream"）不带 hint（网关本地故障形态
-// 未覆盖，不编造）。
 // StreamOption StreamHint 的可选行为开关（均不影响透传字节，只做旁路观测）。
 type StreamOption func(*streamOptions)
 
@@ -496,6 +492,11 @@ func WithErrorFrameObserver(fn func(payload string)) StreamOption {
 	return func(o *streamOptions) { o.onErrorFrame = fn }
 }
 
+// StreamHint 同 Stream，但上游 error 帧透出前把 hintFn(payload) 的返回值写入
+// error.gateway_hint。hintFn 为 nil 或返回空串 → 原样透传（零改写）。
+// 空流兜底 error 帧（"empty upstream stream"）不带 hint（网关本地故障形态
+// 未覆盖，不编造）。
+// opts：旁路观测开关（见 WithErrorFrameObserver），不改变任何透传字节。
 func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, opts ...StreamOption) error {
 	var o streamOptions
 	for _, f := range opts {

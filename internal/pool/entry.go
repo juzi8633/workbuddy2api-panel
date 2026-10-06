@@ -90,7 +90,7 @@ type Status struct {
 	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
 	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
 	// 账号本身健康，只是暂不接流量。
-	Paused          bool       `json:"paused,omitempty"`
+	Paused bool `json:"paused,omitempty"`
 	// FreezeThreshold/Frozen/FrozenReason 低积分自动冻结（与 disabled 正交）：
 	// 余额低于阈值自动冻结、恢复到阈值以上自动解冻。阈值 0 = 关闭（omitempty 使
 	// 未开启该功能的账号状态 JSON 不含新字段，零回归）。
@@ -206,8 +206,8 @@ type entry struct {
 	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
 	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
 	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
-	paused         bool
-	reason         string
+	paused bool
+	reason string
 	// freezeThreshold 低积分自动冻结阈值（0 = 关闭）。由管理面板 SetFreezeThreshold
 	// 设置；credits < freezeThreshold 时账号自动冻结（frozen），余额恢复到阈值以上
 	// 自动解冻。持久化（stateAccount.FreezeThreshold）。

@@ -32,6 +32,15 @@ const bodyIdleTimeout = 300 * time.Second
 // customWriter 不可用时（如测试里的 httptest.ResponseRecorder，不实现
 // ResponseController 所需的接口）静默退化为普通读取——测试不该为了这层防护
 // 而改用真实 listener。
+// readBodyWithTimeout preserves a configured net/http read deadline. With the
+// total timeout disabled, retain the fork's per-read idle protection.
+func readBodyWithTimeout(w http.ResponseWriter, r *http.Request, totalTimeout time.Duration) ([]byte, error) {
+	if totalTimeout > 0 {
+		return io.ReadAll(r.Body)
+	}
+	return readBody(w, r)
+}
+
 func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	rc := http.NewResponseController(w)
 	// 清掉可能存在的 server 级 deadline：我们接管读 deadline 的管理。

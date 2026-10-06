@@ -27,10 +27,13 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	APIKey   string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
+	// BodyReadTimeout matches the HTTP server's total read limit. When zero,
+	// readBody enforces an idle limit instead of limiting ongoing uploads.
+	BodyReadTimeout time.Duration
+	MaxRotate       int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -583,7 +586,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// readBody 而非 io.ReadAll：只对**读间空闲**设限（bodyIdleTimeout），不设总
 	// 时长。曾因 server.ReadTimeout=60s 把慢速上行（多图 base64 长上下文）误杀成
 	// 400「read body: i/o timeout」，生产实测见 cmd/server/http_server.go 注释。
-	body, err := readBody(w, r)
+	body, err := readBodyWithTimeout(w, r, h.cfg.BodyReadTimeout)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
@@ -1074,6 +1077,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 				// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
+				// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 				if sessKey != "" && h.cfg.Session != nil {
 					h.cfg.Session.Bind(sessKey, acct.UID)
 				}

@@ -21,7 +21,7 @@ import (
 // 断言 server 字段值与端到端慢读两条腿：字段断言抓住「有人把 ReadTimeout 加回来」；
 // 端到端断言抓住「字段对了但 Server 没接线到真实 listener」。
 func TestHTTPServerDoesNotCapBodyReadDuration(t *testing.T) {
-	srv := newHTTPServer("127.0.0.1:0", http.NotFoundHandler())
+	srv := newHTTPServer("127.0.0.1:0", http.NotFoundHandler(), 0)
 	if srv.ReadTimeout != 0 {
 		t.Fatalf("ReadTimeout=%v, want 0：请求体无大小上限时不能设总时长（慢上行会被误杀，见注释）", srv.ReadTimeout)
 	}
@@ -52,7 +52,7 @@ func TestHTTPServerAcceptsSlowBody(t *testing.T) {
 		}
 		got <- string(b)
 		w.WriteHeader(http.StatusOK)
-	}))
+	}), 0)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -108,7 +108,16 @@ func TestHTTPServerConstructionStaysWired(t *testing.T) {
 	if bytes.Contains(src, []byte("&http.Server{")) {
 		t.Error("main.go 又内联构造 http.Server——超时参数会绕开 newHTTPServer 的回归保护")
 	}
-	if !bytes.Contains(src, []byte("newHTTPServer(cfg.Listen, h)")) {
+	if !bytes.Contains(src, []byte("newHTTPServer(cfg.Listen, h, cfg.ServerReadTimeoutDur)")) {
 		t.Error("main.go 未用 newHTTPServer(cfg.Listen, h) 构造监听 server")
+	}
+}
+
+func TestHTTPServerHonorsConfiguredReadTimeout(t *testing.T) {
+	for _, timeout := range []time.Duration{0, 300 * time.Second, 12 * time.Second} {
+		srv := newHTTPServer("127.0.0.1:0", http.NotFoundHandler(), timeout)
+		if srv.ReadTimeout != timeout {
+			t.Fatalf("ReadTimeout=%v, want configured %v", srv.ReadTimeout, timeout)
+		}
 	}
 }

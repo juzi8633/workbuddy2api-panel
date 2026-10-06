@@ -193,9 +193,9 @@ func hasKind(kinds []taskKind, k taskKind) bool {
 type fakeUpstream struct {
 	checkinCalls   atomic.Int32
 	refreshCalls   atomic.Int32
+	travelCalls    atomic.Int32
 	resourceRemain int64
 	resourceEnd    string
-	travelCalls    atomic.Int32
 	nightChatCalls atomic.Int32
 }
 

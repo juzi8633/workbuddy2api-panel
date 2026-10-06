@@ -1202,7 +1202,7 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	// 生成类标签：图片与视频（视频两类来自上游 PR #107）。
 	for _, t := range tags {
 		switch strings.ToLower(strings.TrimSpace(t)) {
-		case "text-to-image", "text-to-video", "image-to-video":
+		case "text-to-image", "image-to-image", "text-to-video", "image-to-video":
 			return true
 		}
 	}
