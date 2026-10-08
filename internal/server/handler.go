@@ -152,7 +152,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			trace.captureClientInfo(r)
 		}
 		r = r.WithContext(context.WithValue(r.Context(), requestTraceKey{}, trace))
-		obs := &responseObserver{ResponseWriter: w}
+		obs := &responseObserver{ResponseWriter: w, trace: trace}
 		w.Header().Set("X-Request-Id", trace.id)
 		h.cfg.RequestLog.Begin()
 		defer func() {
@@ -160,7 +160,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if status == 0 {
 				status = http.StatusOK
 			}
-			h.cfg.RequestLog.Record(trace.event(status))
+			event := trace.event(status)
+			h.cfg.RequestLog.Record(event)
+			if trace.stat == nil && status >= 400 {
+				// Pre-model failures used to leave no journal evidence. Do not log
+				// the raw error: it may contain network addresses or client text.
+				log.Printf("WARN: [server] request=%s stage=%s code=%s status=%d duration_ms=%d",
+					trace.id, event.ErrorStage, event.ErrorCode, status, event.DurationMs)
+			}
 		}()
 		h.mux.ServeHTTP(obs, r)
 		return
@@ -171,6 +178,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+			recordGatewayError(w, "invalid_api_key", "auth")
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
@@ -599,6 +607,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 400「read body: i/o timeout」，生产实测见 cmd/server/http_server.go 注释。
 	body, err := readBodyWithTimeout(w, r, h.cfg.BodyReadTimeout)
 	if err != nil {
+		code := "body_read_error"
+		if isBodyIdleTimeout(err) {
+			code = "body_read_timeout"
+		}
+		recordGatewayError(w, code, "read_body")
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
@@ -621,6 +634,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st := newChatStat(time.Now(), body, peek.Stream)
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
+		st.requestID = tr.id
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
@@ -637,6 +651,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
 	sessKey := session.ExtractKey(body)
+	// 缓存前缀隔离独立于粘性；user_id 不参与绑定，但仍按原始消息前缀分缓存。
+	cacheSessionKey := sessKey
+	if cacheSessionKey == "" {
+		cacheSessionKey = session.DerivePromptCacheSessionKey(body)
+	}
 	stickyUID := ""
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
@@ -783,12 +802,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
 	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
 	// RequestID）。
-	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造）；
+	//   - conversationID：body 提取，缺失时复用已算好的 cacheSessionKey 供上游缓存键派生；
 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先，否则按
 	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
 	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
 	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	if chatMeta.ConversationID == "" {
+		chatMeta.ConversationID = cacheSessionKey
+	}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if turnKey != "" && sessKey != "" {
@@ -1482,6 +1504,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
+	recordGatewayError(w, code, "")
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,
@@ -1502,6 +1525,7 @@ const wafCooldownBase = 60 * time.Second
 // error.gateway_hint（hint 为空串时不带字段——未覆盖形态不编造）。
 // message 仍是上游原文透传（hint 只做并列补充，绝不替换/包装 message）。
 func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint string) {
+	recordGatewayError(w, code, "")
 	if hint == "" {
 		writeOpenAIError(w, status, code, msg)
 		return

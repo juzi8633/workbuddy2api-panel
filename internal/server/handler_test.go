@@ -191,7 +191,6 @@ func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
 	}
 }
 
-
 func TestChatNonStreamAggregates(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz != "Bearer at1" {
@@ -843,8 +842,29 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	}
 }
 
+// isolateModelsCache prevents model endpoint tests from depending on earlier tests
+// (including previous -count runs) and restores the process-wide cache afterwards.
+func isolateModelsCache(t *testing.T) {
+	t.Helper()
+	dynamicModelsCache.Lock()
+	ids, fetched, lastFail := dynamicModelsCache.ids, dynamicModelsCache.fetched, dynamicModelsCache.lastFail
+	dynamicModelsCache.ids = nil
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+	t.Cleanup(func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids, dynamicModelsCache.fetched, dynamicModelsCache.lastFail = ids, fetched, lastFail
+		dynamicModelsCache.Unlock()
+	})
+}
+
 func TestModelsEndpoint(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
+	isolateModelsCache(t)
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, `{"code":0,"data":{"models":[{"id":"glm-5.2","maxInputTokens":65536,"maxOutputTokens":8192},{"id":"model-b","maxInputTokens":65536,"maxOutputTokens":8192},{"id":"model-c","maxInputTokens":65536,"maxOutputTokens":8192},{"id":"model-d","maxInputTokens":65536,"maxOutputTokens":8192},{"id":"model-e","maxInputTokens":65536,"maxOutputTokens":8192}]} }`, false
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: up})
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -875,7 +895,7 @@ func TestModelsEndpoint(t *testing.T) {
 // 内容还会随上游目录与可用性筛选变化（不缓存才对）。面板侧在 panel.ServeHTTP
 // 统一设置，这里是 server 包出口的对应契约。覆盖正常 200 与 OpenAI 格式错误响应。
 func TestGatewayResponsesDisabledCaching(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
+	h := NewHandler(Config{Pool: testPoolWith(), Upstream: upstream.New()})
 	cases := []struct {
 		name   string
 		method string
@@ -897,15 +917,12 @@ func TestGatewayResponsesDisabledCaching(t *testing.T) {
 }
 
 func TestModelsDynamic(t *testing.T) {
-	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	isolateModelsCache(t)
 
 	// 假上游返回动态模型（含 agents + maxInputTokens/maxOutputTokens + reasoning 档位）
+	var calls atomic.Int32
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls.Add(1)
 		return 200, `{"code":0,"data":{"models":[{"id":"dyn-model-a","maxInputTokens":65536,"maxOutputTokens":8192,"reasoning":{"effort":"medium","supportedEfforts":["low","medium","high"]}},{"id":"dyn-model-b","maxInputTokens":131072,"maxOutputTokens":16384},{"id":"glm-9.9","maxInputTokens":262144,"maxOutputTokens":32768}],"agents":[{"name":"cli","models":["dyn-model-a","dyn-model-b","glm-9.9"]}]}}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
@@ -925,7 +942,7 @@ func TestModelsDynamic(t *testing.T) {
 	for _, m := range data {
 		ids[m.(map[string]any)["id"].(string)] = true
 	}
-	if !ids["cn:dyn-model-a"] || !ids["cn:glm-9.9"] {
+	if !ids["cn:dyn-model-a"] || !ids["cn:dyn-model-b"] || !ids["cn:glm-9.9"] {
 		t.Errorf("dynamic ids missing: %v", ids)
 	}
 
@@ -933,7 +950,7 @@ func TestModelsDynamic(t *testing.T) {
 	for _, m := range data {
 		mm := m.(map[string]any)
 		switch mm["id"] {
-		case "dyn-model-a":
+		case "cn:dyn-model-a":
 			if mm["context_length"].(float64) != 65536 {
 				t.Errorf("dyn-model-a context_length=%v want 65536", mm["context_length"])
 			}
@@ -941,22 +958,22 @@ func TestModelsDynamic(t *testing.T) {
 				t.Errorf("dyn-model-a max_output_tokens=%v want 8192", mm["max_output_tokens"])
 			}
 			// reasoning 档位透出：supported_efforts + default_effort
-			efforts, _ := mm["supported_efforts"].([]any)
+			efforts, _ := mm["reasoning_supported_efforts"].([]any)
 			if len(efforts) != 3 || efforts[0] != "low" {
-				t.Errorf("dyn-model-a supported_efforts=%v", mm["supported_efforts"])
+				t.Errorf("dyn-model-a supported_efforts=%v", mm["reasoning_supported_efforts"])
 			}
-			if mm["default_effort"] != "medium" {
-				t.Errorf("dyn-model-a default_effort=%v want medium", mm["default_effort"])
+			if mm["reasoning_default_effort"] != "medium" {
+				t.Errorf("dyn-model-a default_effort=%v want medium", mm["reasoning_default_effort"])
 			}
-		case "dyn-model-b":
+		case "cn:dyn-model-b":
 			// 上游未返回 reasoning → 两个档位字段都省略（客户端按自身默认）
-			if _, has := mm["supported_efforts"]; has {
-				t.Errorf("dyn-model-b supported_efforts should be omitted, got %v", mm["supported_efforts"])
+			if _, has := mm["reasoning_supported_efforts"]; has {
+				t.Errorf("dyn-model-b supported_efforts should be omitted, got %v", mm["reasoning_supported_efforts"])
 			}
-			if _, has := mm["default_effort"]; has {
+			if _, has := mm["reasoning_default_effort"]; has {
 				t.Errorf("dyn-model-b default_effort should be omitted")
 			}
-		case "glm-9.9":
+		case "cn:glm-9.9":
 			if mm["context_length"].(float64) != 262144 {
 				t.Errorf("glm-9.9 context_length=%v want 262144", mm["context_length"])
 			}
@@ -966,12 +983,18 @@ func TestModelsDynamic(t *testing.T) {
 		}
 	}
 
-	// 第二次调用走缓存（把上游关掉也成功）
-	dynamicModelsCache.RLock()
-	cached := len(dynamicModelsCache.ids)
-	dynamicModelsCache.RUnlock()
-	if cached != 3 {
-		t.Errorf("cache not populated: %d", cached)
+	// 再发一次请求，既要返回相同目录，也不能再探测上游。
+	before := calls.Load()
+	if before == 0 {
+		t.Fatal("first request did not fetch the fake upstream")
+	}
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec2.Code != http.StatusOK || rec2.Body.String() != rec.Body.String() {
+		t.Fatalf("cached response changed: code=%d body=%s", rec2.Code, rec2.Body)
+	}
+	if got := calls.Load(); got != before {
+		t.Fatalf("cache hit fetched upstream again: calls=%d want %d", got, before)
 	}
 }
 

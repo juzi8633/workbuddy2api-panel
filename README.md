@@ -223,18 +223,23 @@ flowchart LR
 
 ### 方式〇：GHCR 镜像（免克隆免构建）
 
-CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git clone` 之外的部署路径：
+可使用已发布的 GHCR 镜像部署；先将 `WB2API_IMAGE` 设置为你已确认的镜像标签或 digest。**既有 GHCR 镜像不保证包含本 fork 此次配置保存修复**；要使用当前源码的修复，请按方式一从 `juzi8633/workbuddy2api-panel` 构建。下列命令展示可写配置目录挂载方式。
 
 ```bash
-# 1. 准备配置与数据目录
-mkdir -p auths data && cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+# 1. 准备可写配置与数据目录（新部署；已有部署先按下文迁移）
+mkdir -p auths data config
+# 已有目标绝不覆盖；没有示例文件也可留空目录，由程序首启生成配置
+if [ ! -e config/config.json ] && [ -f config.example.json ]; then
+  cp -n config.example.json config/config.json
+fi
+# 建议编辑 config/config.json 设置 api_key；目录与文件归属须匹配容器 UID/GID
 
 # 2. 拉取并运行
 docker run -d --name workbuddy2api \
+  --user "$(id -u):$(id -g)" \
   -p 7863:7863 -e TZ=Asia/Shanghai \
-  -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/linguo2625469/workbuddy2api-panel:latest
+  -v ./auths:/app/auths -v ./data:/app/data -v ./config:/app/config \
+  "${WB2API_IMAGE:?请先设置已确认的镜像标签或digest}" -config /app/config/config.json
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -250,15 +255,18 @@ curl -s http://localhost:7863/healthz
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+git clone https://github.com/juzi8633/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
-# 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
-cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+# 2. 准备可写目录（已有 ./config.json 的部署先按下文迁移）
+mkdir -p auths data config
+if [ ! -e config/config.json ]; then
+  cp -n config.example.json config/config.json
+fi
+# 建议编辑 config/config.json 设置 api_key；已有目标不要覆盖
 
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
-docker compose up -d --build
+PUID=$(id -u) PGID=$(id -g) docker compose up -d --build
 
 # 4. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -747,10 +755,31 @@ http://127.0.0.1:7863/panel/
 
 - **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py`）
 - 以 `app` 用户（uid 10001）运行，`app/auths` 与 `app/data` 预建
-- 镜像内默认落 `config.example.json` 作为空配置（不含密钥），生产用挂载卷覆盖 `/app/config.json`
+- 镜像默认配置路径为 `/app/config.json`；compose 挂载 `./config:/app/config`，追加 `-config /app/config/config.json` 覆盖默认路径（ENTRYPOINT 已带 `-config`，后面的同名参数生效）
 - 内置 `HEALTHCHECK`（`wget /healthz`，30s 间隔）
 
-账号 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config.json`。
+账号 / 数据 / 配置通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config`（配置为 `./config/config.json`）。
+
+**从旧的单文件配置挂载迁移（含自定义 PUID）**：先停止旧容器，避免迁移时面板继续写入。保留原 `./config.json`，将它复制到新的目录；目标已经存在时先检查内容，以下命令不会覆盖它。请勿用示例配置覆盖原来的密钥或未知字段。
+
+```bash
+docker compose down
+mkdir -p auths data config
+if [ ! -e config/config.json ] && [ -f config.json ]; then
+  cp -n config.json config/config.json
+fi
+# 若目标仍不存在，可由程序首启生成；也可按快速开始复制示例
+# 使用创建目录的非 root 用户运行（重新启动时也须设置，或持久化至 .env）
+PUID=$(id -u) PGID=$(id -g) docker compose up -d --build --force-recreate
+```
+
+启动前确保新配置是普通文件（或尚不存在），挂载目录可写、可遍历且不是 `:ro`。若原文件归属其他 UID，复制后检查新文件与目录归属；使用自定义 PUID/PGID 时，可由宿主机管理员执行 `sudo chown -R "$(id -u):$(id -g)" ./auths ./data ./config`，使用默认用户则执行 `sudo chown -R 10001:10001 ./auths ./data ./config`。原 `./config.json` 保留作迁移备份，新的保存只写 `./config/config.json`。
+
+`login.sh` 重启后查询 `/status` 时，优先读取显式指定的 `CONFIG_PATH`，否则优先读取 `config/config.json`，再兼容旧 `config.json`，避免使用迁移备份中的旧 API 密钥。自定义配置位置可用 `CONFIG_PATH=/实际路径/config.json ./login.sh`；显式路径读取失败时不会退回旧配置。
+
+在线保存对普通文件采用同目录唯一临时文件（权限 `0600`）加原子替换，并串行执行读取、深合并、落盘和热应用，保留未提交的未知键。**只让配置文件可写不够，父目录也必须可写且可遍历**：旧挂载 `./config.json:/app/config.json` 的父目录 `/app` 属于 UID 10001，PUID=1000 无法创建临时文件，会报 `permission denied`；应按上面迁移到可写目录。权限失败不会改用截断写入。
+
+旧单文件挂载仅保留 `rename` 返回 `EBUSY` 时的原位写入兼容（仍要求父目录可创建临时文件），此路径不具备原子性。原位写入、同步或关闭失败时，错误会给出完整新内容的临时副本路径；先保留该副本，再停止服务、检查并手工恢复配置。其他失败会清理临时文件，原配置保持不变。
 
 ### 工具脚本
 
@@ -846,7 +875,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？
 
-容器以 `app` 用户（uid 10001）运行，而宿主机挂载的 `./auths`、`./data` 目录属主不是它——写凭证 tmp 文件被拒。三种解法任选（前两种均**无需 root 容器**）：
+容器默认以 `app` 用户（uid 10001）运行，挂载的 `./auths`、`./data`、`./config` 目录及文件归属需要匹配运行 UID/GID。下面两种方式任选；配置保存还需要父目录可写，旧单文件挂载请先按「部署运维 → Docker 镜像」迁移。
 
 ```bash
 # 方案 1（推荐，非 root）：让容器以你自己的 uid 运行——挂载目录本来就是你建的
@@ -855,9 +884,7 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 #   echo "PUID=1000" > .env && echo "PGID=1000" >> .env
 
 # 方案 2：把挂载目录属主交给容器默认用户（需要 sudo）
-sudo chown -R 10001:10001 ./auths ./data ./config.json
-
-# 方案 3：compose 设 user: "0:0" 以 root 运行（NAS/群晖不便 chown 时用）
+sudo chown -R 10001:10001 ./auths ./data ./config
 ```
 
 报错信息里自带这条指引；compose 的 `user` 已参数化为 `${PUID:-10001}:${PGID:-10001}`。

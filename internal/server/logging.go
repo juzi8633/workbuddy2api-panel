@@ -345,6 +345,9 @@ type requestTrace struct {
 	id    string
 	start time.Time
 	stat  *chatStat
+	// Gateway-owned labels only; never retain error messages or request bodies.
+	errorCode  string
+	errorStage string
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -398,10 +401,12 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 
 func (t *requestTrace) event(status int) reqlog.Event {
 	e := reqlog.Event{
-		Time:      t.start,
-		RequestID: t.id,
-		Path:      "/v1/chat/completions",
-		Status:    status,
+		Time:       t.start,
+		RequestID:  t.id,
+		Path:       "/v1/chat/completions",
+		Status:     status,
+		ErrorCode:  t.errorCode,
+		ErrorStage: t.errorStage,
 	}
 	duration := time.Since(t.start)
 	e.DurationMs = duration.Milliseconds()
@@ -441,6 +446,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 type responseObserver struct {
 	http.ResponseWriter
 	status int
+	trace  *requestTrace
 }
 
 func (o *responseObserver) WriteHeader(code int) {
@@ -464,6 +470,19 @@ func (o *responseObserver) Flush() {
 }
 
 func (o *responseObserver) Unwrap() http.ResponseWriter { return o.ResponseWriter }
+
+// recordGatewayError records only fixed gateway labels, not the potentially
+// sensitive error message. A specific earlier classification wins.
+func recordGatewayError(w http.ResponseWriter, code, stage string) {
+	if o, ok := w.(*responseObserver); ok && o.trace != nil {
+		if o.trace.errorCode == "" {
+			o.trace.errorCode = code
+		}
+		if o.trace.errorStage == "" {
+			o.trace.errorStage = stage
+		}
+	}
+}
 
 // 请求流水行的固定列宽（显示列宽，非字节）。取固定宽度而不是让内容自然长度撑开，
 // 是为了让 stdout 里成百上千行能竖着扫——否则模型名长短不一、中文昵称按字节补空格
