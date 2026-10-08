@@ -19,7 +19,7 @@ v1.11.11。版本号规则 `<上游版本>-wb<本 fork 第几个发版>`，例�
 - 根据历史 3 条无错误原因的 pre-model 400 补观测：归档增加可选固定 `error_code` / `error_stage`，读取失败日志带 request ID；成功流水也与归档关联。不记录请求正文或原始错误，不改变 HTTP 错误协议、超时或选号策略。
 - 修复 fork tag 发布校验错误：保留 `-wbN` 后缀，避免拒绝正确 fork tag 或把 fork 产物误标成纯上游版本；直接执行工作流脚本的回归已覆盖。
 - 修正模型列表测试的负缓存串扰、漏掉 `cn:` 的不可达断言，以及只看缓存长度而不验证第二次请求的问题。
-- 生产仍为 wb18，本轮未部署。日志证据、未采纳反馈与验证边界见 [分析报告](docs/analysis/2026-10-08-wb19-feedback-log-repairs.md)。
+- 已于 2026-10-08 20:53 CST 部署 tag `v1.13.0-wb19`（`93025a9`），build `wb2026.10.08+9ac727dd`；配置保持不变，5/5 healthy，最小上游烟测200。日志证据见[分析报告](docs/analysis/2026-10-08-wb19-feedback-log-repairs.md)，产物、备份和流量样本限制见[部署记录](docs/operations/2026-10-08-wb19-deployment.md)。
 
 ## wb17 fork 导入与上游同步 · 2026-10-06
 
