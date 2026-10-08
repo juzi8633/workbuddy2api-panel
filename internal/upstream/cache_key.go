@@ -21,7 +21,7 @@ import (
 // 优先级：
 //  1. body 已带 prompt_cache_key → 原值保留（客户端自知复用哪个键）
 //  2. body 已带 conversation_id / conversationId → 用它做会话哈希源
-//  3. 都没有 → 用入站 conversationID 参数（来自 X-Conversation-ID 头解析）
+//  3. 都没有 → 用调用方传入的缓存会话身份（显式会话 ID 或独立派生键，不要求发送会话头）
 //
 // 安全约束——按账号隔离：
 //   - 生成键格式 `wb2a-<uid8>-<convHex>`

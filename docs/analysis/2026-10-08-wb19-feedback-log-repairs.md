@@ -53,6 +53,7 @@ wb18 代码的请求体读取失败发生在 `chatStat` 创建之前，这类失
 - 优先保留显式会话 ID；没有时使用原始请求派生的稳定会话键。客户端显式 `prompt_cache_key` 原样保留。
 - `user_id` 请求按既有契约不参与粘性绑定，但现在可独立派生**仅用于缓存**的 `system + 首条 user` 键；不会以 user_id 充当会话 ID，也不会哈希整段历史导致每轮变化。
 - 派生在 prompt 改写前完成；追加历史不改键；缺少可派生用户内容仍保留旧空键行为。
+- 审查补修：`ChatMeta.ConversationID` 原来同时驱动缓存与 `X-Conversation-ID`，初版回退会给无显式 ID 请求新增会话头。现增加独立 `PromptCacheSessionKey`，仅交给请求体缓存键派生；会话头继续只透传显式值。实际 HTTP 出站测试同时断言 key 与头的存在/缺失，覆盖流式/非流式及 user_id。
 - 内容派生不是绝对唯一的会话身份；相同初始前缀可能共用键。有精确隔离需求的客户端应传显式会话 ID/缓存键。
 
 ### 配置落盘
@@ -73,6 +74,7 @@ wb18 代码的请求体读取失败发生在 `chatStat` 创建之前，这类失
 ## 验证证据
 
 - 缓存派生测试：旧代码不同前缀撞键（red）；修复后普通/metadata/user_id、显式 key、流式/非流式、passthrough/custom 全通过（green）。
+- 会话头副作用：增加实际出站头断言后，初版回退出现“无显式 ID 却发送派生 X-Conversation-ID”的 red；拆分缓存元数据后 green，显式会话头仍保留，旧只传 ConversationID 的 upstream 调用仍兼容。
 - 配置并发/固定临时文件：旧实现 overlay 回归失败，新实现通过。错误注入覆盖 create、write、rename、fallback open/write/short-write/Sync/Close。
 - 真实非 root API 烟测（UID/GID 65534、空账号、无生产凭证）：旧布局保存 400 且原文件未变；可写目录保存 200，8 个并发更新全部保留，未知键不丢、权限0600，重复 -config 参数最后一个生效。**这是本地进程/文件权限测试，不声称运行了真实 Docker bind mount**；EBUSY 使用故障注入覆盖。
 - 观测测试：旧实现缺 error_code/stage（red）；新实现归档及 journal 可关联、敏感文本不入日志、成功不带错误字段（green）。

@@ -20,8 +20,10 @@ import (
 func promptCacheSessionSender(t *testing.T, promptMode string) func(string, bool) string {
 	t.Helper()
 	type capture struct {
-		key string
-		err error
+		key               string
+		conversationID    string
+		hasConversationID bool
+		err               error
 	}
 	captured := make(chan capture, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -29,7 +31,11 @@ func promptCacheSessionSender(t *testing.T, promptMode string) func(string, bool
 			Key string `json:"prompt_cache_key"`
 		}
 		err := json.NewDecoder(r.Body).Decode(&body)
-		captured <- capture{body.Key, err}
+		captured <- capture{
+			key: body.Key, err: err,
+			conversationID:    r.Header.Get("X-Conversation-ID"),
+			hasConversationID: len(r.Header.Values("X-Conversation-ID")) > 0,
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"id\":\"cache-test\",\"object\":\"chat.completion.chunk\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}\n\n"+
 			"data: {\"id\":\"cache-test\",\"object\":\"chat.completion.chunk\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"+
@@ -76,6 +82,11 @@ func promptCacheSessionSender(t *testing.T, promptMode string) func(string, bool
 			}
 			if got.key == "" {
 				t.Fatal("outbound prompt_cache_key is empty")
+			}
+			// Cache derivation must not invent a protocol-level conversation ID.
+			wantConversationID := session.ResolveConversationID(encoded)
+			if got.conversationID != wantConversationID || got.hasConversationID != (wantConversationID != "") {
+				t.Fatalf("cache fallback changed X-Conversation-ID: got=%q present=%v want=%q", got.conversationID, got.hasConversationID, wantConversationID)
 			}
 			return got.key
 		default:

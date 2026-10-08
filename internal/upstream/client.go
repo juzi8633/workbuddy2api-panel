@@ -1019,7 +1019,12 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	cacheSessionKey := meta.PromptCacheSessionKey
+	if cacheSessionKey == "" {
+		// Compatibility for callers that only supply an explicit conversation ID.
+		cacheSessionKey = meta.ConversationID
+	}
+	prepared := c.prepareBody(body, a.Realm(), a.UID, cacheSessionKey)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
