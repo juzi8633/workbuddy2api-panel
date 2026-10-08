@@ -576,3 +576,71 @@ global 侧（`global_models.go`）的 IDE+CLI 合并不动。
 - wb1 = `panel`：官方 v1.11.11 + 自研 fix2（`readBody` / `ReadTimeout=0` 等）。
   **注**：wb1 与"wb1 + PR #93"两个**不同**的二进制曾共用同一版本串
   `1.11.11-panel` —— 这正是本次改名的动因之一。
+
+---
+
+## wb18 · 2026-10-08 · 跟进上游 v1.13.0 + 读 body 时限语义修正
+
+基线由 `47613d8` 推进到上游 `v1.13.0`（`d66384d`）。仓库这次不是补丁重放，而是
+直接在 `/root/projects/workbuddy2api-panel`（origin = juzi8633/workbuddy2api-panel）
+用 `git merge upstream/main` 完成的——patch 重放在 v1.11.11 → v1.12.0 时已经对不上
+（`.gitignore`/`README.md`/`config.go` 等多处 reject），可维护性已到极限。
+
+### 并入的上游内容
+
+v1.12.0（每日同步工作流此前已合入）与本批补齐的 v1.13.0：
+
+| 提交 | 内容 |
+|---|---|
+| `7e3bc51` | 企业版账号能力门控 + 企业额度展示 |
+| `b3f92dd` | 模型锁池视图（本 fork wb17 已自行实现，合并后取上游版） |
+| `dc19443` | 「全部历史」不再退化成「近 3 天」（issue #121） |
+| `1b90f7f` | 暂停选号单列统计 + 到期提醒按到期时间排序（issue #125） |
+| `a63b7dc` | 图表 tooltip 跟随柱子（issue #128） |
+| `e05edb7` | 速率扣除 TTFB 后不足 200ms 退回端到端（issue #127） |
+| `cfec8f4` | 夜猫子门控用例钉住窗口时钟 |
+
+### 冲突解决原则
+
+五处冲突（`cmd/server/main.go`、`internal/panel/app.js`、`internal/panel/panel.go`、
+`internal/pool/entry.go`、`internal/pool/state.go`）全部**两侧功能都保留**，
+不做「选一边」：
+
+- **frozen（本 fork）与 paused（上游）都要单列**。共用实现返回
+  `(total, healthy, cooling, frozen, disabled, paused, inFlightFull)`，
+  「要不要把 paused 并进 disabled」交给调用方决定——那是调用方的口径问题，
+  不该由共享函数替所有人定。
+- **保持上游签名**：`CountsDetailed`/`CountsDetailedForRealm` 仍是上游的 5 元组，
+  本 fork 的 frozen 走新加的 `FrozenCount`/`FrozenCountForRealm`。理由：这两个函数
+  是上游每日改动的热点，签名分叉会让同步工作流持续冲突。
+- **用量图**：上游的 `<g><title>` 包裹（#128）与本 fork 的积分折线（#58）都在，
+  重组为「一个 `<g>`、一个 `<title>`（多带一行积分观测）、柱体、折线」。
+
+### 修正：`server.read_timeout` 的语义文档
+
+合并后实现是「上游的总时长上限（`read_timeout`，缺省 300s）+ 本 fork 的
+`readBody`（`read_timeout="0"` 时的每读空闲兜底）」，但 `http_server.go`、
+`bodytimeout.go` 的注释与 README 仍写着旧语义（「ReadTimeout 设为 0」、
+「`0` = 不限制」）。照文档配 `"0"` 会误解成「完全无时限」，实际仍受 300s 的
+读间空闲约束。注释与 README 已改写为准确的分工说明。
+
+### 新增回归测试
+
+`TestReadBodyAbortsStalledBody`（`internal/server/bodytimeout_stall_test.go`）：
+端到端钉住「发完请求头就一个字节不发」会被中止。这条防线容易在重构中丢掉——
+deadline 必须装在**每次 Read 之前**。实测把它挪到 Read 之后，该用例 5s 内即 FAIL。
+必须走真实 listener：`httptest.ResponseRecorder` 不实现底层 `net.Conn` 的
+deadline 接口，`readBody` 会静默退化成 `io.ReadAll`，那条路径测不到这层。
+
+配套把 `bodyIdleTimeout` 由 `const` 改为 `var`（默认值不变），让测试能在秒级内
+缩短它并在 defer 中还原。
+
+### 验证
+
+- `go vet` 干净；`go build ./...` 通过；`go test ./...` **19 包全绿**
+  （15 个有测试的包 + 4 个无测试文件）。
+- fork 专属特性存活核查：`buildid` / `freeze` / `modelview` / `bodytimeout` /
+  `timeout` / `mergeAdjacentToolCalls` / `scripts/rehearse.py` 全部在位。
+- 上游 v1.13.0 新特性存活核查：`EnterpriseID` / `CountsDetailedWithPaused` /
+  `Enterprise` / `ModelLockView` 全部在位。
+- 二进制版本串自证：`1.13.0-wb18`；sha256 `79a8523cd19e6e1df64a443ee82cbdc3364063bbc4afba35ce0326ec240475e6`。
