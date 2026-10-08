@@ -487,27 +487,58 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	return e.a
 }
 
-// CountsDetailed 返回 total/healthy/cooling/frozen/disabled/inFlightFull 六类计数。
-// cooling 含常规冷却（until）、熔断期（breakerUntil）与连败降权（degradeUntil）——
-// **不含低积分冻结**：冻结单列 frozen（无倒计时，与 cooling 的"等一会儿会恢复"
-// 语义不同；此前冻结号被并进 cooling，运维从汇总看不出冻结规模，只能逐行看标签）。
-// 分类互斥且按判定优先级短路：disabled > frozen > cooling > healthy。
+// CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull（paused 并入
+// disabled，= /status 的「不可用」口径）。监控/脚本只关心"还能不能用"，这个口径
+// 对它们是稳定契约，不因面板展示需要而改变；面板要分开计数，用 CountsDetailedWithPaused。
+//
+// 本 fork 另有一路 **低积分冻结（frozen）**：它单列、**不计入 cooling**（冻结无
+// 倒计时，与 cooling 的"等一会儿会恢复"不是同一类运维处置）。为不改变上游签名的
+// 语义，冻结数由 FrozenCount / FrozenCountForRealm 单独查询。
+// cooling 含常规冷却（until）、熔断期（breakerUntil）与连败降权（degradeUntil）。
+// 分类互斥且按判定优先级短路：disabled > paused > frozen > cooling > healthy。
 // 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/frozen/until/breakerUntil）；
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
-func (p *Pool) CountsDetailed() (total, healthy, cooling, frozen, disabled, inFlightFull int) {
-	return p.countsDetailedForRealm("")
+func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
+	t, h, c, _, d, pz, i := p.countsDetailedForRealm("")
+	return t, h, c, d + pz, i
+}
+
+// CountsDetailedWithPaused 同 CountsDetailed，但 paused 与 disabled 分开返回。
+//
+// 面板概况要回答「禁用几个、暂停几个」——暂停只关选号、照常签到保活，与禁用混成
+// 一个数字会让人误判池子的真实状况（issue #125）。
+func (p *Pool) CountsDetailedWithPaused() (total, healthy, cooling, disabled, paused, inFlightFull int) {
+	t, h, c, _, d, pz, i := p.countsDetailedForRealm("")
+	return t, h, c, d, pz, i
 }
 
 // CountsDetailedForRealm 同 CountsDetailed，但仅统计 Realm()==realm 的账号；
 // realm=="" 不加谓词（= CountsDetailed）。供 /status 按域分组透出。
-func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, frozen, disabled, inFlightFull int) {
-	return p.countsDetailedForRealm(realm)
+func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
+	t, h, c, _, d, pz, i := p.countsDetailedForRealm(realm)
+	return t, h, c, d + pz, i
 }
 
-// countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
-// 冻结号单列 frozen（不计入 cooling）：冻结没有倒计时，与冷却不是同一类运维处置。
-func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, frozen, disabled, inFlightFull int) {
+// FrozenCount 返回全池低积分冻结（frozen）账号数。本 fork 专属：冻结与 cooling
+// 互斥且没有倒计时，运维需要在汇总里一眼看到冻结规模（见 freeze_threshold）。
+func (p *Pool) FrozenCount() int { return p.FrozenCountForRealm("") }
+
+// FrozenCountForRealm 同 FrozenCount，但仅统计 Realm()==realm 的账号。
+func (p *Pool) FrozenCountForRealm(realm string) int {
+	_, _, _, f, _, _, _ := p.countsDetailedForRealm(realm)
+	return f
+}
+
+// countsDetailedForRealm 是共用遍历实现；realm=="" 不加谓词。
+//
+// frozen 单列、paused 也单列，两个「要不要合并」的决定都留给调用方：
+//   - frozen 无倒计时，与 cooling 不是同一类运维处置，故永不并进 cooling；
+//   - paused 与 disabled 同样不可选，/status 要的是「还能不能用」（合并），
+//     面板要的是「禁用几个、暂停几个」（分开，issue #125）。
+//
+// 返回顺序：total, healthy, cooling, frozen, disabled, paused, inFlightFull。
+func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, frozen, disabled, paused, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -517,10 +548,12 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, fr
 		}
 		total++
 		switch {
-		case e.disabled || e.paused:
-			// paused（暂停选号）与 disabled 同样不可选，合并计入 disabled 类
-			//（/status 的「不可用」口径）；细粒度区分由 Status.Paused 透出。
+		case e.disabled:
 			disabled++
+		case e.paused:
+			// 暂停选号：退出选号候选，但照常签到 / 活跃上报 / 保活 / 刷新余额。
+			// 它与「禁用」是两种运维状态，这里分开计；要不要合并由调用方决定。
+			paused++
 		case e.frozen:
 			frozen++ // 低积分冻结：单列计数（不与 cooling 混计）
 		case !e.healthy(now):
@@ -532,7 +565,7 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, fr
 			}
 		}
 	}
-	return total, healthy, cooling, frozen, disabled, inFlightFull
+	return total, healthy, cooling, frozen, disabled, paused, inFlightFull
 }
 
 // ServableNow 报告池当前是否可服务：存在至少一个 healthy 且未占满在途名额的账号。
@@ -592,6 +625,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
 		Realm:                    e.a.Realm(),
+		Enterprise:               e.a.IsEnterprise(),
 		Nickname:                 e.a.Nickname,
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,

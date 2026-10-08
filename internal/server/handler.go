@@ -179,7 +179,7 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
-	total, healthy, _, _, _, _ := h.cfg.Pool.CountsDetailed()
+	total, healthy, _, _, _ := h.cfg.Pool.CountsDetailed()
 	// 用 ServableNow 判定：healthy>0 但全占满在途时 chat 会 503，探活必须同口径，
 	// 否则负载均衡器会把流量持续打进无法受理的实例。
 	status := http.StatusOK
@@ -203,7 +203,11 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
-	total, healthy, cooling, frozen, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
+	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
+	// frozen 是本 fork 的低积分冻结：单列且与 cooling 互斥，所以单独取一次
+	//（它不在上游 CountsDetailed 的签名里——保持上游签名不变才能让每日
+	//  upstream 自动合并不产生无谓冲突）。
+	frozen := h.cfg.Pool.FrozenCount()
 	sticky := 0
 	if h.cfg.StickyCount != nil {
 		sticky = h.cfg.StickyCount()
@@ -230,8 +234,8 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 		// 只新增键，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
 		"realm_totals": map[string]map[string]int{
-			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
-			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
+			"cn":     countsMapFromForRealm(h.cfg.Pool, "cn"),
+			"global": countsMapFromForRealm(h.cfg.Pool, "global"),
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
@@ -251,7 +255,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// countsMapFrom 把 CountsDetailed 六元组打包成 /status 的域分组建模。
+// countsMapFrom 把 CountsDetailed 元组（+ 本 fork 的 frozen）打包成 /status 的域分组建模。
 func countsMapFrom(total, healthy, cooling, frozen, disabled, inFlightFull int) map[string]int {
 	return map[string]int{
 		"total":          total,
@@ -261,6 +265,13 @@ func countsMapFrom(total, healthy, cooling, frozen, disabled, inFlightFull int) 
 		"disabled":       disabled,
 		"in_flight_full": inFlightFull,
 	}
+}
+
+// countsMapFromForRealm 同 countsMapFrom，但按域取计数（realm 的 frozen 由
+// FrozenCountForRealm 单独提供，理由同 countsMapFrom 的注释）。
+func countsMapFromForRealm(pool *pool.Pool, realm string) map[string]int {
+	t, h, c, d, i := pool.CountsDetailedForRealm(realm)
+	return countsMapFrom(t, h, c, pool.FrozenCountForRealm(realm), d, i)
 }
 
 // dynamicModelsCache 动态模型缓存。

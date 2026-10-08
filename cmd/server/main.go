@@ -48,12 +48,12 @@ import (
 //     产物指纹的正确归属是 overview 的 build 字段（机器算、自证）。
 //
 // 硬要求：每批发版必须让它变化（cache-busting 依赖"版本一变 URL 一变"）。
-// 加一批就 wb8 → wb9，并把该批内容记进 CHANGELOG.md。
+// 加一批就 wb17 → wb18，并把该批内容记进 CHANGELOG.md。
 //
 // 上游 CI 有一条 tag 断言会 `SRC="${SRC%-panel}"` 后比 tag，因此带 "+特性" 的后缀
 // 本就不满足它（我们从没跑过上游 CI）。改成 "-wbN" 同样不满足，但至少是**有意**的
 // 命名，而不是把三件事塞进一个串的副产品。
-const appVersion = "1.12.0-wb17"
+const appVersion = "1.13.0-wb18"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。

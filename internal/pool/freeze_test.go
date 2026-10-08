@@ -473,19 +473,24 @@ func TestFreezeCountsDetailedSeparatesFrozenFromCooling(t *testing.T) {
 	p.Cooldown("c1", CoolSoft, time.Hour, "429")
 	p.Disable("d1", "manual disable")
 
-	total, healthy, cooling, frozen, disabled, inFlightFull := p.CountsDetailed()
+	// frozen 不在 CountsDetailed 的签名里（保持上游签名不变，见 state.go 注释），
+	// 由 FrozenCount 单独取。
+	total, healthy, cooling, disabled, inFlightFull := p.CountsDetailed()
+	frozen := p.FrozenCount()
 	if total != 4 || healthy != 1 || cooling != 1 || frozen != 1 || disabled != 1 || inFlightFull != 0 {
 		t.Fatalf("counts: total=%d healthy=%d cooling=%d frozen=%d disabled=%d inFlightFull=%d (want 4/1/1/1/1/0)",
 			total, healthy, cooling, frozen, disabled, inFlightFull)
 	}
-	total, healthy, cooling, frozen, disabled, _ = p.CountsDetailedForRealm("cn")
+	total, healthy, cooling, disabled, _ = p.CountsDetailedForRealm("cn")
+	frozen = p.FrozenCountForRealm("cn")
 	if total != 4 || healthy != 1 || cooling != 1 || frozen != 1 || disabled != 1 {
 		t.Fatalf("realm counts: total=%d healthy=%d cooling=%d frozen=%d disabled=%d (want 4/1/1/1/1)",
 			total, healthy, cooling, frozen, disabled)
 	}
 	// 解冻后回 healthy，frozen 归零（不会同时出现在 cooling 里）。
 	p.Revive("f1")
-	_, healthy, cooling, frozen, _, _ = p.CountsDetailed()
+	_, healthy, cooling, _, _ = p.CountsDetailed()
+	frozen = p.FrozenCount()
 	if healthy != 2 || cooling != 1 || frozen != 0 {
 		t.Fatalf("解冻后: healthy=%d cooling=%d frozen=%d (want 2/1/0)", healthy, cooling, frozen)
 	}
