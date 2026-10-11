@@ -7,6 +7,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -420,5 +421,114 @@ func TestFoldTextIntoPrevToolCall(t *testing.T) {
 	]`)
 	if _, changed3 := mergeAdjacentToolCalls(in3); changed3 {
 		t.Fatal("数组正文不该被折叠（会丢结构）")
+	}
+}
+
+// Empty names veto the whole ID, preserving the existing set-based pairing rules.
+func TestCleanupOrphanToolCallsEmptyName(t *testing.T) {
+	for _, name := range []string{"", " \t\r\n", "\u00a0\u2003"} {
+		t.Run("paired_"+name, func(t *testing.T) {
+			in := msgs(t, `[
+				{"role":"user","content":"q"},
+				{"role":"assistant","content":"keep text","reasoning_content":"keep reasoning","tool_calls":[
+					{"id":"bad","function":{"name":"","arguments":"{}"}},
+					{"id":"good","function":{"name":" read ","arguments":"{\"path\":\"x\"}"}}
+				]},
+				{"role":"tool","tool_call_id":"bad","content":"bad result"},
+				{"role":"tool","tool_call_id":"good","content":"good result"},
+				{"role":"user","content":"next"}
+			]`)
+			calls := in[1].(map[string]any)["tool_calls"].([]any)
+			calls[0].(map[string]any)["function"].(map[string]any)["name"] = name
+			want := msgs(t, `[
+				{"role":"user","content":"q"},
+				{"role":"assistant","content":"keep text","reasoning_content":"keep reasoning","tool_calls":[
+					{"id":"good","function":{"name":" read ","arguments":"{\"path\":\"x\"}"}}
+				]},
+				{"role":"tool","tool_call_id":"good","content":"good result"},
+				{"role":"user","content":"next"}
+			]`)
+			out, changed := cleanupOrphanToolCalls(in)
+			if !changed || !reflect.DeepEqual(out, want) {
+				t.Fatalf("changed=%v, got %#v; want only the healthy pair and unchanged context", changed, out)
+			}
+			if again, changed := cleanupOrphanToolCalls(out); changed || !reflect.DeepEqual(again, want) {
+				t.Fatal("cleanup must be idempotent")
+			}
+		})
+	}
+
+	for _, results := range []string{"", `,{"role":"tool","tool_call_id":"bad","content":"r"}`} {
+		t.Run("all_bad"+results, func(t *testing.T) {
+			in := msgs(t, `[{"role":"assistant","content":"keep","tool_calls":[{"id":"bad","function":{"name":""}}]}`+results+`]`)
+			out, changed := cleanupOrphanToolCalls(in)
+			want := msgs(t, `[{"role":"assistant","content":"keep"}]`)
+			if !changed || !reflect.DeepEqual(out, want) {
+				t.Fatalf("changed=%v, got %#v; want assistant preserved without tool_calls or results", changed, out)
+			}
+		})
+	}
+
+	t.Run("duplicate_ID_veto_in_either_order", func(t *testing.T) {
+		for _, calls := range []string{
+			`{"id":"dup","function":{"name":"read"}},{"id":"dup","function":{"name":""}}`,
+			`{"id":"dup","function":{"name":""}},{"id":"dup","function":{"name":"read"}}`,
+		} {
+			in := msgs(t, `[{"role":"assistant","content":"keep","tool_calls":[`+calls+`]},
+				{"role":"tool","tool_call_id":"dup","content":"r1"},
+				{"role":"tool","tool_call_id":"dup","content":"r2"}]`)
+			out, changed := cleanupOrphanToolCalls(in)
+			if !changed || !reflect.DeepEqual(out, msgs(t, `[{"role":"assistant","content":"keep"}]`)) {
+				t.Fatal("an empty name must veto every call and result sharing its ID")
+			}
+		}
+	})
+
+	t.Run("missing_or_non_string_fields_unchanged", func(t *testing.T) {
+		for _, fields := range []string{
+			``, `,"function":{}`, `,"function":null`, `,"function":"placeholder"`,
+			`,"function":{"name":null}`, `,"function":{"name":123}`, `,"function":{"name":" read "}`,
+		} {
+			body := `[{"role":"tool","tool_call_id":"c","content":"r"},
+				{"role":"assistant","tool_calls":[{"id":"c"` + fields + `}]}]`
+			in := msgs(t, body)
+			out, changed := cleanupOrphanToolCalls(in)
+			if changed || !reflect.DeepEqual(out, msgs(t, body)) {
+				t.Fatalf("existing set-based pairing changed for fields %s", fields)
+			}
+		}
+	})
+
+	t.Run("empty_ID_still_no_traffic", func(t *testing.T) {
+		body := `[{"role":"assistant","tool_calls":[{"id":"","function":{"name":""}}]},
+			{"role":"tool","tool_call_id":"","content":"r"}]`
+		out, changed := cleanupOrphanToolCalls(msgs(t, body))
+		if changed || !reflect.DeepEqual(out, msgs(t, body)) {
+			t.Fatal("empty IDs must retain the existing no-traffic behavior")
+		}
+	})
+}
+
+func TestPrepareBodyRepairsEmptyToolCallName(t *testing.T) {
+	body := `{"model":"gpt-6-sol","messages":[
+		{"role":"assistant","content":"keep","tool_calls":[
+			{"id":"bad","type":"function","function":{"name":" \t","arguments":"{}"}},
+			{"id":"good","type":"function","function":{"name":"read","arguments":"{}"}}
+		]},
+		{"role":"tool","tool_call_id":"bad","content":"bad result"},
+		{"role":"tool","tool_call_id":"good","content":"good result"}
+	]}`
+	var obj map[string]any
+	if err := json.Unmarshal(PrepareBodyOptWithEfforts([]byte(body), false, nil), &obj); err != nil {
+		t.Fatal(err)
+	}
+	want := msgs(t, `[
+		{"role":"assistant","content":"keep","tool_calls":[
+			{"id":"good","type":"function","function":{"name":"read","arguments":"{}"}}
+		]},
+		{"role":"tool","tool_call_id":"good","content":"good result"}
+	]`)
+	if !reflect.DeepEqual(obj["messages"], want) {
+		t.Fatalf("outbound history still contains an invalid pair: %v", obj["messages"])
 	}
 }

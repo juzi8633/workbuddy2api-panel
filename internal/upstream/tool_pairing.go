@@ -11,6 +11,8 @@
 // 的条目让会话自愈，宁可丢一轮工具上下文，也好过整条会话死亡。
 package upstream
 
+import "strings"
+
 // repackToolResultBlocks 把插在 assistant.tool_calls 与其 tool 结果之间的非 tool 消息
 // 挪到整组之后，保证同一批 tool_call 的结果在 wire 上连续。
 //
@@ -124,6 +126,7 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	}
 	callIDs := map[string]bool{}
 	resultIDs := map[string]bool{}
+	nameBadIDs := map[string]bool{}
 	hasTraffic := false
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
@@ -145,6 +148,9 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 					}
 					if id, ok := tc["id"].(string); ok && id != "" {
 						callIDs[id] = true
+						if toolCallNameEmpty(tc) {
+							nameBadIDs[id] = true
+						}
 						hasTraffic = true
 					}
 				}
@@ -155,8 +161,13 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 		return messages, false
 	}
 	// keepCalls：调用 id 是否双侧齐全（调用存在且结果存在）。重复 id 与乱序均按集合处理。
+	// Empty or whitespace-only function.name is rejected even when paired. Veto the
+	// ID so the existing symmetric pruning removes both calls and results.
 	keepCalls := map[string]bool{}
 	for id := range callIDs {
+		if nameBadIDs[id] {
+			continue
+		}
 		if resultIDs[id] {
 			keepCalls[id] = true
 		}
@@ -344,4 +355,18 @@ func emptyContent(v any) bool {
 		return len(c) == 0
 	}
 	return false
+}
+
+// toolCallNameEmpty only rejects an explicitly present blank string name.
+// Missing or non-string function/name fields retain the existing pairing behavior.
+func toolCallNameEmpty(tc map[string]any) bool {
+	fn, ok := tc["function"].(map[string]any)
+	if !ok {
+		return false
+	}
+	name, ok := fn["name"].(string)
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(name) == ""
 }
