@@ -16,6 +16,8 @@ Conflicts were append-only test conflicts in `internal/server/handler_test.go` a
 
 - Upstream issue #145: expose the expiry card and its Check button on initial rendering. Opening the accounts view still does not query the upstream. Initial text explains how to load expiry information.
 - Upstream open PR #148: discard explicitly empty or whitespace-only function names from request history with their paired tool results. Preserve existing orphan cleanup and missing-field behavior. This change is scoped to history sanitation; it does not implement Codex subagent support.
+- Supplemental review fixed duplicate streaming termination after repaired calls with `length` / `content_filter` (and other terminal reasons).
+- Structured calls take precedence in mixed frames and disable further markup conversion. Pending markup is preserved as text. If synthetic calls were already delivered, subsequent native indices receive a fixed offset to preserve names and argument continuations. Already emitted synthetic calls cannot be retracted or reliably deduplicated against later native calls; no full-stream buffering is introduced.
 - Advance the application version to `1.13.0-wb20` so the panel asset cache is invalidated for this batch.
 
 ## Production evidence (read-only)

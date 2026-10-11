@@ -536,13 +536,13 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 
 	// 标记修复（见 dsml.go）：把上游正文里的原生工具调用标记还原成 delta.tool_calls。
 	// 客户端没声明过 tools 时 repair.Enabled() 为 false → 整条流零改写零分配。
-	//   - synthIdx：本流已还原的调用数（合成的 index 从上游最大 index 之后接续）；
-	//   - maxToolIdx：上游已用过的最大 tool_call index，避免合成的 index 与真实调用撞车；
-	//   - toolFinishSent：是否已发出过 finish_reason: tool_calls，供流尾兜底。
+	// 合成调用先占用 0..synthIdx-1；一旦收到结构化调用，停止标记转换，
+	// 后续结构化 index 固定偏移 synthIdx，避免覆盖已经发出的调用。
+	// 已发出的合成调用无法撤回，也无法判定后来的结构化调用是否重复同一调用。
 	repair := o.markup
 	synthIdx := 0
-	maxToolIdx := -1
-	toolFinishSent := false
+	structuredSeen := false
+	finishSent := false
 
 	// writeSSE 原样写出一帧并 flush。
 	writeSSE := func(payload string) error {
@@ -567,9 +567,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		return writeSSE(payload)
 	}
 
-	// writeChunk 把一个 chunk 对象按规范白名单重建后写出并 flush，同时维护三件跨帧
-	// 状态：tool_calls name 收敛（每 index 仅首片带 name）、消息 id 续传、以及上游
-	// 已用过的最大 tool_call index（供标记修复接续编号）。
+	// writeChunk 规范化、写出并 flush，维护 name 收敛、消息 id 和终止帧状态。
 	// fallback 是规范化失败时的兜底原文（与修复前「marshal 失败即原样透传」一致）。
 	writeChunk := func(obj map[string]any, fallback string) error {
 		// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
@@ -589,19 +587,8 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				if c == nil {
 					continue
 				}
-				d, _ := c["delta"].(map[string]any)
-				if d == nil {
-					continue
-				}
-				tcs, _ := d["tool_calls"].([]any)
-				for _, tci := range tcs {
-					tc, _ := tci.(map[string]any)
-					if tc == nil {
-						continue
-					}
-					if v, ok := tc["index"].(float64); ok && int(v) > maxToolIdx {
-						maxToolIdx = int(v)
-					}
+				if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+					finishSent = true
 				}
 			}
 		}
@@ -622,6 +609,40 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		chs, ok := obj["choices"].([]any)
 		if !ok {
 			return []map[string]any{obj}
+		}
+		// 先检查整帧，再喂正文：同帧内的结构化调用具有优先权。
+		for _, ci := range chs {
+			c, _ := ci.(map[string]any)
+			d, _ := c["delta"].(map[string]any)
+			tcs, _ := d["tool_calls"].([]any)
+			if len(tcs) > 0 {
+				structuredSeen = true
+			}
+			if synthIdx > 0 {
+				for _, tci := range tcs {
+					tc, _ := tci.(map[string]any)
+					if tc == nil {
+						continue
+					}
+					// 与 stripToolCallNames 一致：缺 index 的调用默认归 0。
+					idx, _ := tc["index"].(float64)
+					tc["index"] = idx + float64(synthIdx)
+				}
+			}
+		}
+		if structuredSeen {
+			var out []map[string]any
+			if pending := repair.Flush(); pending != "" {
+				out = append(out, map[string]any{
+					"choices": []any{map[string]any{
+						"index": 0, "delta": map[string]any{"content": pending},
+					}},
+				})
+			}
+			if synthIdx > 0 {
+				rewriteFinishReason(obj, "tool_calls")
+			}
+			return append(out, obj)
 		}
 		var calls []MarkupCall
 		for _, ci := range chs {
@@ -648,8 +669,8 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		if len(calls) == 0 {
 			// 本帧没命中标记；但本流此前还原过调用 → 把上游的 stop 收尾改写成
 			// tool_calls，客户端据此知道「回合以工具调用结束」而不是「模型只说了话」。
-			if synthIdx > 0 && rewriteFinishReason(obj, "tool_calls") {
-				toolFinishSent = true
+			if synthIdx > 0 {
+				rewriteFinishReason(obj, "tool_calls")
 			}
 			return []map[string]any{obj}
 		}
@@ -660,7 +681,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		fr := takeFinishReason(obj)
 		out := []map[string]any{obj}
 		for _, call := range calls {
-			idx := maxToolIdx + 1 + synthIdx
+			idx := synthIdx
 			synthIdx++
 			out = append(out, markupCallFrame(obj, idx, call))
 		}
@@ -669,7 +690,6 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				fr = "tool_calls"
 			}
 			out = append(out, finishOnlyFrame(obj, fr))
-			toolFinishSent = fr == "tool_calls"
 		}
 		return out
 	}
@@ -758,7 +778,7 @@ readLoop:
 			}
 			validFrames++
 		}
-		if synthIdx > 0 && !toolFinishSent {
+		if synthIdx > 0 && !finishSent {
 			if werr := writeChunk(finishOnlyFrame(map[string]any{}, "tool_calls"), ""); werr != nil {
 				return werr
 			}

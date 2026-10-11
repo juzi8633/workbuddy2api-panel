@@ -1371,3 +1371,110 @@ func TestStreamWithoutMarkupRepairIsUnchanged(t *testing.T) {
 		t.Fatalf("未声明 tools 时输出被改动\nbase=%s\ngot =%s", base.Body.String(), disabled.Body.String())
 	}
 }
+
+func TestStreamMarkupRepairPreservesTerminalFinish(t *testing.T) {
+	block := mkBlock(mkInvoke("exec_command", mkParam("cmd", "pwd")))
+	for _, finish := range []string{"length", "content_filter", "stop", "tool_calls", ""} {
+		for _, sameFrame := range []bool{false, true} {
+			t.Run(finish+"/sameFrame="+strconv.FormatBool(sameFrame), func(t *testing.T) {
+				raw := upstreamSSEWithContent([]string{block}, finish)
+				if sameFrame {
+					raw = markupReviewFrame(t, map[string]any{"content": block}, finish) + "data: [DONE]\n\n"
+				}
+				repair := NewMarkupRepair(testTools, false)
+				rec := httptest.NewRecorder()
+				if err := StreamHint(rec, strings.NewReader(raw), nil, WithMarkupRepair(repair)); err != nil {
+					t.Fatal(err)
+				}
+				var finishes []string
+				calls := 0
+				for _, f := range viewSSE(t, rec.Body.String()) {
+					calls += len(f.calls)
+					if f.finish != "" {
+						finishes = append(finishes, f.finish)
+					}
+				}
+				want := finish
+				if want == "stop" || want == "" {
+					want = "tool_calls"
+				}
+				if calls != 1 || len(finishes) != 1 || finishes[0] != want {
+					t.Fatalf("calls=%d finishes=%v, want one call and one %q finish", calls, finishes, want)
+				}
+			})
+		}
+	}
+}
+
+func markupReviewFrame(t *testing.T, delta map[string]any, finish string) string {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"id": "review", "choices": []any{map[string]any{
+		"index": 0, "delta": delta, "finish_reason": finish,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "data: " + string(b) + "\n\n"
+}
+
+func TestStreamMarkupRepairStructuredCalls(t *testing.T) {
+	block := mkBlock(mkInvoke("exec_command", mkParam("cmd", "pwd")))
+	structured := func(content string, index int, name, args string) map[string]any {
+		return map[string]any{"content": content, "tool_calls": []any{map[string]any{
+			"index": index, "id": "native", "type": "function",
+			"function": map[string]any{"name": name, "arguments": args},
+		}}}
+	}
+	for _, scenario := range []string{"same-frame", "structured-first", "pending-text", "synthetic-first"} {
+		t.Run(scenario, func(t *testing.T) {
+			raw, wantText, wantCalls := "", block, 2
+			switch scenario {
+			case "same-frame":
+				raw = markupReviewFrame(t, structured(block, 0, "native_tool", "{"), "")
+			case "structured-first":
+				raw = markupReviewFrame(t, structured("", 0, "native_tool", "{"), "") +
+					markupReviewFrame(t, map[string]any{"content": block}, "")
+			case "pending-text":
+				cut := len(block) / 2
+				raw = markupReviewFrame(t, map[string]any{"content": block[:cut]}, "") +
+					markupReviewFrame(t, structured(block[cut:], 0, "native_tool", "{"), "")
+			case "synthetic-first":
+				raw = markupReviewFrame(t, map[string]any{"content": block}, "") +
+					markupReviewFrame(t, structured(block, 0, "native_tool", "{"), "")
+				wantCalls = 3
+			}
+			raw += markupReviewFrame(t, structured("", 0, "native_tool", "}"), "") +
+				markupReviewFrame(t, map[string]any{"content": block}, "stop") + "data: [DONE]\n\n"
+			wantText += block
+			repair := NewMarkupRepair(testTools, false)
+			rec := httptest.NewRecorder()
+			if err := StreamHint(rec, strings.NewReader(raw), nil, WithMarkupRepair(repair)); err != nil {
+				t.Fatal(err)
+			}
+			var text strings.Builder
+			var calls []map[string]any
+			for _, f := range viewSSE(t, rec.Body.String()) {
+				text.WriteString(f.content)
+				calls = append(calls, f.calls...)
+			}
+			if text.String() != wantText || len(calls) != wantCalls {
+				t.Fatalf("text=%q calls=%d, want text=%q calls=%d", text.String(), len(calls), wantText, wantCalls)
+			}
+			nativeIdx, start := float64(0), 0
+			if scenario == "synthetic-first" {
+				nativeIdx, start = 1, 1
+				if calls[0]["index"] != float64(0) || calls[0]["function"].(map[string]any)["name"] != "exec_command" {
+					t.Fatalf("synthetic call corrupted: %v", calls[0])
+				}
+			}
+			first, next := calls[start], calls[start+1]
+			fn, nextFn := first["function"].(map[string]any), next["function"].(map[string]any)
+			if first["index"] != nativeIdx || next["index"] != nativeIdx || first["id"] != "native" || fn["name"] != "native_tool" || fn["arguments"] != "{" || nextFn["arguments"] != "}" {
+				t.Fatalf("native call corrupted: first=%v next=%v", first, next)
+			}
+			if _, present := nextFn["name"]; present {
+				t.Fatalf("continuation name was not stripped: %v", nextFn)
+			}
+		})
+	}
+}
