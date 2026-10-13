@@ -634,29 +634,40 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		CreditsEarliestRemaining: e.creditsEarliestRemaining,
 		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
 		Paused:                   e.paused,
-		Reason:                   e.reason,
-		Disabled:                 e.disabled,
-		FreezeThreshold:          e.freezeThreshold,
-		Frozen:                   e.frozen,
-		FrozenReason:             e.frozenReason,
-		SuccessCount:             e.successCount,
-		ErrTotal:                 e.errTotal,
-		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
-		TokenUsage:               e.tokenUsage,
-		LastSuccessTime:          e.lastSuccess,
-		LastErrTime:              e.lastErr,
-		Until:                    e.until,
-		SoftStreak:               e.softStreak,
-		ModelCosts:               p.modelCostsStatusLocked(e, now),
-		ConsecutiveFails:         e.consecutiveFails,
-		DegradeUntil:             e.degradeUntil,
-		InFlight:                 int(e.inFlight.Load()),
-		BreakerFails:             e.fails,
-		BreakerUntil:             e.breakerUntil,
+		// Reason 不在此处直接透出：见下方「过期即不再展示」的门控。
+		Disabled:         e.disabled,
+		FreezeThreshold:  e.freezeThreshold,
+		Frozen:           e.frozen,
+		FrozenReason:     e.frozenReason,
+		SuccessCount:     e.successCount,
+		ErrTotal:         e.errTotal,
+		CheckinDone:      e.lastCheckinDay == now.Format("2006-01-02"),
+		TokenUsage:       e.tokenUsage,
+		LastSuccessTime:  e.lastSuccess,
+		LastErrTime:      e.lastErr,
+		Until:            e.until,
+		SoftStreak:       e.softStreak,
+		ModelCosts:       p.modelCostsStatusLocked(e, now),
+		ConsecutiveFails: e.consecutiveFails,
+		DegradeUntil:     e.degradeUntil,
+		InFlight:         int(e.inFlight.Load()),
+		BreakerFails:     e.fails,
+		BreakerUntil:     e.breakerUntil,
 	}
 	if st.Disabled {
-		// 禁用账号透出禁用原因（运维看不到为什么死）。
+		// 禁用账号透出原因（运维看不到为什么死）：DisabledReason 是专用字段，
+		// Reason 同时保留，兼容既有面板/脚本读取（禁用是终态，与冷却截止无关）。
 		st.DisabledReason = e.reason
+	}
+	// 「过期即不再展示」：reason 没有过期钩子（到期是时间比较，不是事件），冷却结束后
+	// e.reason 会一直留着上次的原文（如 "429 rate limit"），而面板标签只按倒计时字段
+	// 判定 → 出现「可用」旁边挂着 429 的自相矛盾。因此口径与面板标签对齐：**只要这一行
+	// 不是「可用」就透出原因**——禁用（终态）、冷却中（until/熔断期未过）、暂停选号、
+	// 低积分冻结、连败降权期未过。冷却自然到期、成功请求（NoteSuccess 不碰 reason）
+	// 之后不再对外暴露；运维仍可从 last_err / err_total / 限额台账看历史。
+	degraded := now.Before(e.degradeUntil)
+	if st.Disabled || st.Cooling || e.paused || e.frozen || degraded {
+		st.Reason = e.reason
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
