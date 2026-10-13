@@ -2,11 +2,14 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"syscall"
 	"time"
 )
 
@@ -91,4 +94,50 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 func isBodyIdleTimeout(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// classifyReadBodyErr 把读 body 的失败归成固定分类，供日志/归档记录。
+//
+// 为什么需要（2026-10-13 生产实测）：read_body 失败此前只记 body_read_error，
+// 全部 56 条都没有明细 —— 300s 空闲守卫一次都没触发，但运维无法区分「客户端自己
+// 断开」与「我们主动掐」，也就无法判断该不该调 bodyIdleTimeout。分类后可以看到
+// 43/56 是客户端在 ~30s 处断开（与我们的配置无关）。
+//
+// 返回值是固定枚举（**不是** err.Error()）：原始文本可能含网络地址或客户端内容。
+//
+//	server_timeout  我们自己装的 deadline 到期（唯一需要调参的形态）
+//	client_canceled 请求 ctx 被取消（客户端主动放弃）
+//	peer_closed     对端在 body 读完前关闭连接（客户端超时/取消）
+//	peer_reset      连接被重置或写不动（链路或对端 RST）
+//	other           无法归类（保留原样，便于继续收窄）
+func classifyReadBodyErr(err error) string {
+	if err == nil {
+		return "none"
+	}
+	// 顺序要紧：先判「我们自己的 deadline」。它也是 net.Error 的一种，若放到后面
+	// 会被 peer_reset 抢先归类，从而掩盖真正需要调参的形态。
+	if isBodyIdleTimeout(err) {
+		return "server_timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "client_canceled"
+	}
+	var se *os.SyscallError
+	if errors.As(err, &se) {
+		if errors.Is(se.Err, syscall.ECONNRESET) || errors.Is(se.Err, syscall.EPIPE) {
+			return "peer_reset"
+		}
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, net.ErrClosed) {
+		return "peer_reset"
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return "peer_closed"
+	}
+	// 到这里仍属 net.Error 的（非 timeout、非上述几种）按对端断开归类。
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return "peer_reset"
+	}
+	return "other"
 }

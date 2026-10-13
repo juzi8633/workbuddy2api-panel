@@ -13,6 +13,19 @@ v1.11.11。版本号规则 `<上游版本>-wb<本 fork 第几个发版>`，例�
 
 
 
+## wb23 · 2026-10-13 · 三项实测问题的根因修复
+
+三项都先复现出**量化证据**再改代码，每项都有修复前红、修复后绿的回归。
+
+- **过期积分优先策略实际反向（issue #160）**。根因是奖励形态：`weight = 积分比例×10 + idle`，命中快过期再 `×3` —— 系数乘在「积分比例」这个**与快过期负相关**的基数上（积分会过期，恰恰因为该号被用得少、余额低）。实测 8 号池、快过期号余额 200：占比 **16.2%，低于均分 33.3%**；余额 5823 时才是 43.6%。改为**加法**（额外 `+ expiringVirtualSlots × creditWeightScale`，即 +30）：低余额快过期号 5.7% → **32.1%**，与哈希路径（`realm.go` 的 3 槽位，8 号池约 30%）终于同口径——README 一直声称两条路径一致，此前只有哈希路径真的成立。顺带把裸魔数 `10` 提为 `creditWeightScale`，并修正 README 与配置表里「×3」的表述（它们描述的是一个反向的策略）。
+  回归：`internal/pool/issue160_expiring_test.go`、`pool_test.go`（`TestPreferExpiringDisabledRestoresWeight` 断言改为加法）。
+
+- **请求体读取失败无法归因**。生产 3 天 56 次 `body_read_error`，其中 43 次是 `axonhub/1.0` 且时长精确聚在 29.4–30.0s——与 `readHeaderTimeout = 30s` 同值，一度像我们的配置把 body 读也卡在 30s。写用例判定：头超时 1s、客户端 2s 后才发 body，仍返回 200 完整读到 → **头截止不会泄漏进 body 读**（Go 在读完头后用 `ReadTimeout=0` 的清零截止覆盖它），30s 簇是客户端自己断开。真正的问题是 WARN 行刻意不打印底层错误，运维无从区分「客户端断的」与「我们掐的」。新增 `classifyReadBodyErr` 固定五类标签（`server_timeout` / `client_canceled` / `peer_closed` / `peer_reset` / `other`），经 `error_detail` 落归档与 WARN 行——**只记分类词，不记原始文本**（保持既有的不泄漏策略）。实测 56 次无一命中 300s 空闲守卫，故结论是无需调参。
+  回归：`internal/server/readbody_classify_test.go`（含真实 TCP 断开）、`headertimeout_body_test.go`、`request_error_metadata_test.go`。
+
+- **导入 JSON：只有 access token 的账号一条也进不来（issue #165）**。`refresh_token` 被误列为必填（`auth.Parse` 只要求 `accessToken`），且 `imported===0 && skipped>0` 仍渲染成绿色成功、跳过原因只写 `console.warn`。按上游建议实现四条：① 必填降为 `uid` + `access_token`，`uid` 回退 `id` → JWT `sub`，过期时间按 `expires_at`（**量级判毫秒/秒**，旧代码无条件 `/1000` 会把秒值变成 1970 年、绕过「未知」兜底）→ JWT `exp`；② 响应区分 `warnings`（已导入但需知情）与 `errors`（跳过），前端两者都上屏，全失败按失败样式渲染；③ 无 `refresh_token` 时导入仅**警告**，真正的禁用放在 handler「确实需要刷新而 refresh_token 为空」时（那时才既不能续期也不该空转）——修复前实测该路径会白跑刷新并污染熔断计数（`ErrTotal:1 BreakerFails:1`），把整个池拖慢；④ 兼容裸数组 / `{"accounts":[...]}` / 顶层单对象 / **UTF-8 BOM**（PowerShell 5.1 写 BOM，`encoding/json` 不吞）。
+  回归：`internal/panel/import_issue165_test.go`（含落盘 `ExpiresAt` 端到端断言）、`internal/server/missing_refresh_token_test.go`。
+
 ## wb22 · 2026-10-13 · 过期冷却原因不再显示
 
 - 修复面板「可用」标签旁挂着旧限流文案：`e.reason` 没有过期钩子（冷却到期只是时间比较，不是事件；`NoteSuccess` 也刻意不碰它），因此冷却结束后旧原文会在界面长期残留，与按倒计时字段判定的标签自相矛盾。生产实测：账号 `28f60c37` 的 `until` 停在 10-08 10:33、`reason` 仍是 `429 rate limit`，而账号当时正在正常服务。

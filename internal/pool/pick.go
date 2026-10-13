@@ -407,9 +407,9 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 // weightOf 计算单个账号的普通加权分值。
 func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := 1.0
-	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
+	// 1. credits 比例 ×creditWeightScale（计入 mid-credit 锚点，避免全员 0 时该项为 0）。
 	if maxCredits > 0 {
-		w += float64(e.credits) / float64(maxCredits) * 10
+		w += float64(e.credits) / float64(maxCredits) * creditWeightScale
 	}
 	// 2. 闲置补偿。
 	if e.lastUsed.IsZero() {
@@ -439,12 +439,28 @@ func expiringNow(e *entry, now time.Time) bool {
 		e.creditsEarliestExpiry.After(now)
 }
 
-// routingWeightOf 在普通账号权重上叠加快过期虚拟实例数量。prefer_expiring=false
-// 或账号无有效快过期批次时，实例数恒为 1，结果与旧 weightOf 完全一致。
+// routingWeightOf 在普通账号权重上叠加快过期奖励。prefer_expiring=false
+// 或账号无有效快过期批次时，结果与旧 weightOf 完全一致。
+//
+// 奖励形态是**加上 expiringVirtualSlots 个「满额积分」权重单位**（+3×creditWeightScale），
+// 不是把整个权重乘 3（issue #160）。
+//
+// 为什么不能乘：权重主项是「积分比例 ×10」，而积分会快过期恰恰因为该号被用得少、
+// 余额低——快过期与低余额在现实中高度相关。乘系数会把偏好实现在一个**小**基数上：
+// 实测（8 号池，余额 5724/4096/5030/5823/4094/4060/5766/5683，其中一档 3 天内到期）
+//
+//	快过期号余额 5823（高）→ 21%→43.6%，偏好生效
+//	快过期号余额  200（低）→ 16.2%，**低于均分 33.3%**，偏好实际反向
+//
+// 改为加法后：低余额快过期号 5.7%→32.1%，与哈希路径（realm.go 的 ×3 虚拟实例，
+// 8 号池约 30%）终于同口径——README 声称两条路径一致，此前只有哈希路径真的成立。
+//
+// 保留 creditsWeightScale 作为量纲（而非写死 30）：奖励恒等于「expiringVirtualSlots
+// 个满分号」，与哈希路径的「3 个槽位」严格对应，两条路径随同一常量变动。
 func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := p.weightOf(e, maxCredits, now)
 	if p.preferExpiring && expiringNow(e, now) {
-		return w * expiringVirtualSlots
+		return w + float64(expiringVirtualSlots)*creditWeightScale
 	}
 	return w
 }

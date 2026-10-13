@@ -118,3 +118,66 @@ func TestSuccessfulRequestCorrelatesTableAndArchive(t *testing.T) {
 		t.Fatalf("success must omit error metadata: %s", data)
 	}
 }
+
+// TestReadBodyFailureIncludesClassifiedDetail 是上面用例的补充：error_detail 必须是
+// **固定分类标签**，让运维能区分「客户端断的」与「我们掐的」，同时仍然不泄漏原文。
+//
+// 为什么需要（2026-10-13 生产核对）：56 次 read_body 失败此前只有 body_read_error，
+// 300s 空闲守卫一次都没触发，但日志无从看出失败是客户端自己断开（43/56 是 axonhub
+// 在 ~30s 处断开）还是我们的 deadline。没有分类就只能靠时长分布猜。
+func TestReadBodyFailureIncludesClassifiedDetail(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantDetail string
+		err              error
+	}{
+		{"我们的空闲守卫到期", "server_timeout", uploadTimeout{}},
+		{"客户端提前断开", "peer_closed", io.ErrUnexpectedEOF},
+		{"无法归类", "other", errors.New("private credential and prompt")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := reqlog.New(reqlog.Config{})
+			defer logs.Close()
+			h := NewHandler(Config{RequestLog: logs})
+			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			r.Body = failedUpload{err: tc.err}
+			h.ServeHTTP(httptest.NewRecorder(), r)
+
+			recent := logs.Snapshot().Recent
+			if len(recent) != 1 {
+				t.Fatalf("events = %d want 1", len(recent))
+			}
+			if got := recent[0].ErrorDetail; got != tc.wantDetail {
+				t.Fatalf("error_detail=%q want %q", got, tc.wantDetail)
+			}
+			data, err := json.Marshal(recent[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 分类标签之外不得夹带原始错误文本。
+			if bytes.Contains(data, []byte(tc.err.Error())) && tc.err.Error() != tc.wantDetail {
+				t.Fatalf("raw read error leaked into metadata: %s", data)
+			}
+		})
+	}
+}
+
+// TestSuccessfulRequestOmitsErrorDetail 确保新字段不污染成功事件（零回归）。
+func TestSuccessfulRequestOmitsErrorDetail(t *testing.T) {
+	withChatLog(t)
+	logs := reqlog.New(reqlog.Config{})
+	defer logs.Close()
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{RequestLog: logs, Upstream: up, Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "fake", ExpiresAt: 9999999999})})
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`)))
+	e := logs.Snapshot().Recent[0]
+	if e.ErrorDetail != "" {
+		t.Fatalf("success must not carry error_detail: %q", e.ErrorDetail)
+	}
+	data, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`"error_detail"`)) {
+		t.Fatalf("success must omit error_detail: %s", data)
+	}
+}

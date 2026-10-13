@@ -6,9 +6,16 @@ import (
 	"time"
 )
 
-// expiringVirtualSlots 快过期账号在新会话候选集中的虚拟实例权重。
-// 3:1 是温和偏好，不是固定比例：账号组成变化会自然改变最终占比。
+// expiringVirtualSlots 快过期账号的权重单位数：在哈希路径（本文件）表现为列表里
+// 出现 3 次（3 个槽位），在加权随机路径（pick.go routingWeightOf）表现为额外加
+// 3×creditWeightScale 个「满额积分」权重。两条路径共用本常量，保证口径一致
+// （issue #160：此前加权路径是「整个权重 ×3」，与哈希路径并不等价）。
 const expiringVirtualSlots = 3
+
+// creditWeightScale 积分比例项的权重系数：满额账号该项值 = creditWeightScale。
+// 单独提为常量，供 routingWeightOf 把快过期奖励表达成「N 个满分号」的量纲
+// （见那里的注释），避免在选号权重里出现裸魔数 10。
+const creditWeightScale = 10.0
 
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
 // realm=="" 退化为 AvailableUIDs（现状语义）。

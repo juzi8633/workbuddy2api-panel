@@ -410,8 +410,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `pool.breaker_cooldown_max` | `6h` | 熔断指数退避封顶 |
 | `pool.idle_weight_per_hour` | `0.5` | 闲置补偿：每小时未使用 +0.5 权重 |
 | `pool.idle_weight_max` | `5.0` | 闲置补偿权重封顶 |
-| `pool.prefer_expiring` | `true` | 快过期积分加权：窗口内仍有有效快过期批次的账号，选号权重 ×3（虚拟实例）；不按到期时间排序、与批次金额无关；是软偏好，弱于会话粘性与模型成本分层（#101） |
-| `pool.expiring_soon` | `168h` | 快过期加权窗口：仅窗口内仍有有效批次的账号命中上述 ×3；窗口开大 → 命中账号变多、偏好被稀释；留空或 `0` 关闭 |
+| `pool.prefer_expiring` | `true` | 快过期积分加权：窗口内仍有有效快过期批次的账号，额外获得 `expiringVirtualSlots`(=3) 个「满额积分」权重单位（**加法**，非乘法——见 #160）；不按到期时间排序；是软偏好，弱于会话粘性与模型成本分层（#101） |
+| `pool.expiring_soon` | `168h` | 快过期加权窗口：仅窗口内仍有有效批次的账号命中上述奖励；窗口开大 → 命中账号变多、偏好被稀释；留空或 `0` 关闭 |
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
@@ -518,15 +518,13 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 2. 按模型实测成本分层，只保留当前最优层
 3. 默认开启快过期积分加权（软偏好，不改排序）：
 
-   - 在模型成本最优层内，`expiring_soon` 窗口内仍有有效快过期批次的账号，选号权重 ×3（`expiringVirtualSlots` 虚拟实例展开，会话粘性路径同口径）。
-   - 不按到期时间排序、与批次金额无关：14 天后到期与 3 天后到期、1 分与几千分，只要在窗口内待遇相同。
+   - 在模型成本最优层内，`expiring_soon` 窗口内仍有有效快过期批次的账号获得额外权重：加权随机路径加 `expiringVirtualSlots` 个「满额积分」权重单位（+30），会话哈希路径在候选列表里展开为 `expiringVirtualSlots` 个槽位——两条路径同口径。
+   - 该奖励是**加法**而非乘法（issue #160）：积分会快过期恰恰因为该号被用得少、余额低，乘法会把偏好实现在一个与快过期负相关的小基数上，导致低余额快过期号反而不如均分（实测 16% vs 均分 33%）。
+   - 不按到期时间排序：14 天后到期与 3 天后到期待遇相同；但奖励与余额无关、基础权重仍含积分项，故高积分号依旧获得更多流量。
    - 该偏好弱于会话粘性（绑定号健康则直接使用）与模型成本分层（按实测成本硬过滤）；已过期、零余额、无有效到期时间的账号不进入加权集。
-4. 同一候选池内加权随机（快过期命中账号在上面的基础上 ×3）：
+4. 同一候选池内加权随机：
 
-   `weight = credits 比例 ×10 + idleWeight`
-
-   - `credits 比例` = 该号积分 / 候选集最大积分
-   - `idleWeight` = `min(闲置小时 × idle_weight_per_hour, idle_weight_max)`，从未使用给满分
+   `weight = 1 + credits 比例 ×10 + idleWeight`（快过期命中时再 `+ 3×10`）
 5. 防惊群：跳过 100ms 内刚被选中的账号；全冷却时从非禁用、非余额耗尽的软冷却 / 熔断账号中选最早到期者顶班
 
 ### 会话粘性

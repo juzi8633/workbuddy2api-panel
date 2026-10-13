@@ -348,6 +348,11 @@ type requestTrace struct {
 	// Gateway-owned labels only; never retain error messages or request bodies.
 	errorCode  string
 	errorStage string
+	// errorDetail 是**分类标签**而非原始错误文本（如 "peer_closed"）：原始 err 可能含
+	// 网络地址或客户端内容，不能入日志/归档。需要这层分类的原因：read_body 失败此前
+	// 只记 body_read_error，无法区分「客户端自己断开」与「我们主动掐」，运维无从判断
+	// 该不该调 bodyIdleTimeout（2026-10-13 生产 56 次失败全落在这个盲区里）。
+	errorDetail string
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -407,6 +412,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		Status:     status,
 		ErrorCode:  t.errorCode,
 		ErrorStage: t.errorStage,
+		// ErrorDetail 是固定分类标签（"peer_closed" 等），非原始错误文本。
+		ErrorDetail: t.errorDetail,
 	}
 	duration := time.Since(t.start)
 	e.DurationMs = duration.Milliseconds()
@@ -481,6 +488,15 @@ func recordGatewayError(w http.ResponseWriter, code, stage string) {
 		if o.trace.errorStage == "" {
 			o.trace.errorStage = stage
 		}
+	}
+}
+
+// recordGatewayErrorDetail 记录**分类标签**（如 "peer_closed"），不是原始错误文本。
+// 调用方必须传入固定枚举值，禁止把 err.Error() 直接传进来——原始文本可能含网络
+// 地址或客户端内容，而分类标签让运维能判断「谁断的、要不要调参」。
+func (t *requestTrace) recordErrorDetail(detail string) {
+	if t != nil && t.errorDetail == "" {
+		t.errorDetail = detail
 	}
 }
 

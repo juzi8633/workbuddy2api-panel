@@ -165,8 +165,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if trace.stat == nil && status >= 400 {
 				// Pre-model failures used to leave no journal evidence. Do not log
 				// the raw error: it may contain network addresses or client text.
-				log.Printf("WARN: [server] request=%s stage=%s code=%s status=%d duration_ms=%d",
-					trace.id, event.ErrorStage, event.ErrorCode, status, event.DurationMs)
+				// detail=%s 是固定分类标签（如 peer_closed），不是原始文本——没有它
+				// 就无法区分「客户端断开」与「我们超时」（read_body 的 56 次盲区）。
+				if event.ErrorDetail != "" {
+					log.Printf("WARN: [server] request=%s stage=%s code=%s detail=%s status=%d duration_ms=%d",
+						trace.id, event.ErrorStage, event.ErrorCode, event.ErrorDetail, status, event.DurationMs)
+				} else {
+					log.Printf("WARN: [server] request=%s stage=%s code=%s status=%d duration_ms=%d",
+						trace.id, event.ErrorStage, event.ErrorCode, status, event.DurationMs)
+				}
 			}
 		}()
 		h.mux.ServeHTTP(obs, r)
@@ -612,6 +619,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			code = "body_read_timeout"
 		}
 		recordGatewayError(w, code, "read_body")
+		// 分类标签：区分「客户端自己断开」与「我们主动掐」。此前只记 code，56 次
+		// 生产失败全落在这个盲区，无法判断该不该调 bodyIdleTimeout（实测 43 次是
+		// 客户端在 ~30s 处断开，与我们 300s 的空闲守卫无关）。
+		if tr := requestTraceFrom(r); tr != nil {
+			tr.recordErrorDetail(classifyReadBodyErr(err))
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
@@ -890,6 +903,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
+			// 需要刷新但根本没有 refresh_token（issue #165 建议 3）：这是**永久性**
+			// 状态，重试再多次也不会成功。此时必须禁用该账号，而不是走下面的通用
+			// 失败分支——否则每次请求都会白跑一轮刷新、顺带 NoteError 堆熔断计数，
+			// 最终把整个池拖慢（其它账号要陪着退避换号）。
+			//
+			// 导入时不禁用（那时 access token 还有效、账号可用），只在「确实需要
+			// 刷新」这个时点禁用：既不能续期，也不该继续空转。
+			if strings.TrimSpace(acct.RefreshToken) == "" {
+				const reason = "missing refresh_token (re-login required)"
+				h.cfg.Pool.Disable(acct.UID, reason)
+				lastErr = fmt.Errorf("account %s: %s", acct.UID, reason)
+				fail(acct.UID)
+				if !rotateBackoff(i, r.Context()) {
+					break
+				}
+				continue
+			}
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
 				lastErr = err
 				var ue *upstream.Error

@@ -72,8 +72,13 @@ type Event struct {
 	Outcome   string    `json:"outcome"`
 	// ErrorCode / ErrorStage are fixed gateway labels, never upstream or client text.
 	// Older archives omit them; successful requests also leave them absent.
-	ErrorCode        string  `json:"error_code,omitempty"`
-	ErrorStage       string  `json:"error_stage,omitempty"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	ErrorStage string `json:"error_stage,omitempty"`
+	// ErrorDetail is a fixed classification label (e.g. "peer_closed",
+	// "server_timeout"), never raw error text: it answers "who aborted" for
+	// failures that ErrorCode alone cannot distinguish (read_body had this blind
+	// spot: 56 production failures, all recorded only as body_read_error).
+	ErrorDetail      string  `json:"error_detail,omitempty"`
 	DurationMs       int64   `json:"duration_ms"`
 	TTFBMs           int64   `json:"ttfb_ms,omitempty"`
 	Attempts         int     `json:"attempts,omitempty"`

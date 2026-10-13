@@ -1236,11 +1236,32 @@ $('importFile').onchange = async () => {
     const r = await fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-    $('importDone').hidden = false;
-    $('importDone').textContent = '导入完成：成功 ' + d.imported + ' 个' + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
-    if (d.errors && d.errors.length) {
-      console.warn('import errors:', d.errors);
+    // 上屏：成功数 + 跳过原因 + 警告（issue #165）。旧版把 errors 只丢进
+    // console.warn，「成功 0 个 / 跳过 1 个」还渲染成绿色成功，用户只能得出
+    // 「导入功能坏了」。现在只要有跳过就按失败样式显示，并逐条列出原因。
+    const skipped = d.skipped || 0;
+    const warnList = d.warnings || [];
+    const errList = d.errors || [];
+    const allFailed = d.imported === 0 && skipped > 0;
+    const box = allFailed ? $('importErr') : $('importDone');
+    const other = allFailed ? $('importDone') : $('importErr');
+    other.hidden = true;
+    box.hidden = false;
+    let msg = '导入' + (allFailed ? '失败' : '完成') + '：成功 ' + d.imported + ' 个' +
+      (skipped ? '，跳过 ' + skipped + ' 个' : '');
+    // 原因逐条上屏（最多 8 条，其余折叠计数，避免刷屏）。
+    const lines = [];
+    for (const e of errList.slice(0, 8)) lines.push('✗ ' + e);
+    if (errList.length > 8) lines.push('… 另有 ' + (errList.length - 8) + ' 条跳过原因');
+    for (const w of warnList.slice(0, 8)) lines.push('! ' + w);
+    if (warnList.length > 8) lines.push('… 另有 ' + (warnList.length - 8) + ' 条警告');
+    box.textContent = msg + (lines.length ? '\n' + lines.join('\n') : '');
+    if (lines.length) {
+      box.style.whiteSpace = 'pre-wrap';
+      box.style.textAlign = 'left';
     }
+    if (errList.length) console.warn('import skipped:', errList);
+    if (warnList.length) console.warn('import warnings:', warnList);
     loadOverview(true);
   } catch (e) {
     $('importErr').hidden = false;

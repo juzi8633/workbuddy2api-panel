@@ -1799,8 +1799,11 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	we := p.routingWeightOf(p.byUID["a"], 100, now)
 	wn := p.routingWeightOf(p.byUID["b"], 100, now)
 	p.mu.Unlock()
-	if we != wn*expiringVirtualSlots {
-		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
+	// 快过期奖励是**加法**（+ expiringVirtualSlots 个满额积分单位），不是乘法：
+	// 乘法会把偏好实现在「积分比例 ×10」这个与快过期负相关的基数上（issue #160）。
+	bump := float64(expiringVirtualSlots) * creditWeightScale
+	if we != wn+bump {
+		t.Fatalf("enabled expiring weight=%v want %v (base %v + %v)", we, wn+bump, wn, bump)
 	}
 
 	p.SetPreferExpiring(false)
