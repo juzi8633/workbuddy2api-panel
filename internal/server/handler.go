@@ -814,6 +814,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
 	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
+	// ConversationID 只透传客户端显式给出的对话 ID，**不**用会话键伪造：该字段
+	// 同时决定出站的 X-Conversation-ID，伪造会改变客户端可见协议行为。
+	// 无 conversation_id 的客户端（Anthropic / Claude Code）由 PromptCacheSessionKey
+	// 单独承载缓存身份（client.go 里优先级高于 ConversationID），因此不会退化成
+	// 「每账号一个常量、所有客户端共抢同一个前缀缓存槽」——与上游 20254d8 的意图
+	// 相同，但把缓存身份与会话请求头解耦，两者互不污染。
 	chatMeta := upstream.ChatMeta{
 		ConversationID:        session.ResolveConversationID(body),
 		PromptCacheSessionKey: cacheSessionKey,
