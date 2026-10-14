@@ -666,6 +666,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
+	// realmEmpty 记录「本次请求的域一个账号都没有」（下方 acct==nil 分支填充）：
+	// 域为空与「有账号但都不可用」要给出不同的 hint（前者让运维去加号，后者去查故障）。
+	realmEmpty := false
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -879,6 +882,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 			// 在这里取一次快照，供下方错误构造区分（issue #102 附带发现 1）。
 			modelBlock = h.cfg.Pool.ModelBlocked(bareModel)
+			// 再取一次「该域到底有几个账号」的确定性事实：域为空（total==0）与
+			// 「有账号但都不可用」是完全不同的两件事，通用文案会把后者说成前者。
+			// 生产实证：global 域唯一账号被移除后，24 条 503 全是通用文案，
+			// 而 /status 早已显示 realm_totals.global.total=0，无人察觉。
+			if realm != "" {
+				rt, _, _, _, _ := h.cfg.Pool.CountsDetailedForRealm(realm)
+				realmEmpty = rt == 0
+			}
 			break
 		}
 		st.uid = acct.UID
@@ -1320,6 +1331,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 与 code 同一判据（ctx 已取消），不得留 noHealthyHint：它是运维的排查
 		// 入口，留着「池中没有可用的健康账号」等于没修。
 		hint = upstream.ClientCanceledHint()
+	} else if realmEmpty {
+		// 该域一个账号都没有：通用文案会让运维去 /status 找个说法，而 /status 只会
+		// 在 realm_totals 里安静地显示 total:0。直接点名空域 + 其他域可用情况 +
+		// 恢复动作（生产实证：这个状态持续数小时无人察觉）。
+		hint = upstream.RealmEmptyHint(realm, h.realmCountsExcept(realm))
 	} else if errors.Is(lastErr, errUpstreamTimeout) {
 		hint = upstream.UpstreamTimeoutHint()
 	} else if errors.As(lastErr, &ue) {
@@ -1721,4 +1737,21 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
 		msg = uerr.Msg
 	}
 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
+}
+
+// realmCountsExcept 返回除 `except` 之外所有已知域的账号总数（用于组 hint）。
+//
+// 目前只有 cn/global 两域（auth.Realm() 的取值域），但这里按列表写而不是硬编码
+// 两个分支：将来加域时只需往 realms 里添一项，文案自动带上。
+func (h *Handler) realmCountsExcept(except string) []upstream.RealmCount {
+	realms := []string{"cn", "global"}
+	out := make([]upstream.RealmCount, 0, len(realms))
+	for _, r := range realms {
+		if r == except {
+			continue
+		}
+		t, _, _, _, _ := h.cfg.Pool.CountsDetailedForRealm(r)
+		out = append(out, upstream.RealmCount{Realm: r, Total: t})
+	}
+	return out
 }

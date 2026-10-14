@@ -11,6 +11,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -120,6 +121,42 @@ const clientCanceledHint = "调用方在响应完成前断开（客户端超时�
 
 // ClientCanceledHint 调用方断开的 gateway_hint（与 client_canceled code 配套）。
 func ClientCanceledHint() string { return clientCanceledHint }
+
+// RealmEmptyHint 构造「请求的那个域一个账号都没有」的 hint。
+//
+// 为什么必须单独一条：`no_healthy_account` 的通用文案是「池中没有可用的健康账号；
+// 请查看 /status 或稍后重试」，但 **`/status` 恰恰不会告诉运维「这个域根本没加过
+// 账号」** —— 它只在 realm_totals 里安静地显示 total:0。生产实况：global 域唯一
+// 账号被移除后，每次请求都拿这条通用文案，运维只能靠人工翻 journal 才能发现
+// 「不是号挂了，是这个域一个号都没有」（持续数小时、24 条 503）。
+//
+// 参数都是**确定性事实**（各域账号数与当前请求的域），不含对成因的猜测。
+// 只在 realmTotal==0 时调用（有账号但全不可用属于另一种情况，通用文案更合适）。
+func RealmEmptyHint(realm string, other []RealmCount) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "「%s」域目前没有任何账号（账号总数 0），该域的请求必然失败", realm)
+	if realm != "cn" {
+		// 明确「其他域是好的」，否则运维会以为整个网关挂了 —— 生产上 cn 域当时
+		// 8/8 健康，而报错只提「池中没有可用的健康账号」，方向完全反了。
+		for i, rc := range other {
+			if i > 0 {
+				b.WriteString("、")
+			}
+			fmt.Fprintf(&b, "；%s 域有 %d 个账号", rc.Realm, rc.Total)
+		}
+		if len(other) > 0 {
+			b.WriteString("（这些域不受影响，请改用不带域前缀或对应前缀的模型名）")
+		}
+	}
+	fmt.Fprintf(&b, "；恢复方式：在面板重新登录并添加一个「%s」域的账号", realm)
+	return b.String()
+}
+
+// RealmCount 一个域的账号计数（供 RealmEmptyHint 组装文案）。
+type RealmCount struct {
+	Realm string
+	Total int
+}
 
 // ModelBlockedHint 模型级阻塞（每个账号都对该模型处于 11102/6004 冷却）的
 // hint 前缀；具体账号数与最早解封时间由 handler 拼接。
