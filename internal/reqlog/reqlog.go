@@ -125,6 +125,10 @@ type Snapshot struct {
 	InFlight        int64        `json:"in_flight"`
 	Succeeded       int64        `json:"succeeded"`
 	Failed          int64        `json:"failed"`
+	// Interrupted 调用方主动断开（499 client_canceled）的条数。单独暴露而不是
+	// 并进 Failed：它不是服务端失败，但也不能从总数里消失（运维要看得到
+	// 「有多少请求是调用方自己走了」）。
+	Interrupted int64 `json:"interrupted"`
 	SuccessRate     float64      `json:"success_rate"`
 	HTTPSuccessRate float64      `json:"http_success_rate"`
 	AvgDurationMs   float64      `json:"avg_duration_ms"`
@@ -139,6 +143,7 @@ type Recorder struct {
 	inFlight    int64
 	completed   int64
 	succeeded   int64
+	interrupted int64
 	httpSuccess int64
 	durationSum int64
 	recent      []Event
@@ -191,6 +196,13 @@ func (r *Recorder) Record(e Event) {
 	if e.OK {
 		r.succeeded++
 	}
+	// 调用方中断单独计数：它既不是成功（人没拿到完整响应），也不是服务端失败
+	// （服务端无可归因之处）。计进 completed，但不计进 succeeded，于是
+	// Failed = completed - succeeded 里**仍会包含它** —— 所以 Failed 与
+	// SuccessRate 必须按下方的「可归因分母」单独算，不能再用这个减法。
+	if e.Outcome == OutcomeInterrupted {
+		r.interrupted++
+	}
 	if e.Status >= 200 && e.Status < 300 {
 		r.httpSuccess++
 	}
@@ -218,10 +230,26 @@ func (r *Recorder) Snapshot() Snapshot {
 		Succeeded: r.succeeded,
 		Recent:    append([]Event(nil), r.recent...),
 	}
+	s.Interrupted = r.interrupted
+	// 分母用「可归因于服务端的请求」= completed − interrupted。
+	//
+	// 为什么不能直接用 completed：调用方主动断开（499）既不计 succeeded，也不是
+	// 我们的失败。用 completed 当分母时，一个客户端自己超时放弃的请求会同时拉低
+	// 成功率——那正是「把调用方的问题记成我们的故障」的度量版。把 interrupted 从
+	// 分母摘出去，服务端成功率才只反映服务端。
+	//
+	// 但 completed 不减少（总数不能凭空少一条），interrupted 也单独透出，
+	// 运维仍然看得到「有多少请求是调用方自己走了」。
+	// 分母 = 可归因于服务端的请求数。全是被调用方中断时它会变成 0：此时成功率
+	// 无定义（不是 0%，也不是 100%），保持零值让前端显示「—」，而不是算出 NaN
+	// 或假装 0%。
+	denom := r.completed - r.interrupted
+	if denom > 0 {
+		s.Failed = denom - r.succeeded
+		s.SuccessRate = round1(float64(r.succeeded) / float64(denom) * 100)
+		s.HTTPSuccessRate = round1(float64(r.httpSuccess) / float64(denom) * 100)
+	}
 	if r.completed > 0 {
-		s.Failed = r.completed - r.succeeded
-		s.SuccessRate = round1(float64(r.succeeded) / float64(r.completed) * 100)
-		s.HTTPSuccessRate = round1(float64(r.httpSuccess) / float64(r.completed) * 100)
 		s.AvgDurationMs = float64(r.durationSum) / float64(r.completed)
 	}
 	r.mu.Unlock()

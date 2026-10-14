@@ -870,6 +870,9 @@ function renderRequestMetrics(m, entries) {
     ' · 成功 ' + (m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%') +
     ' · HTTP ' + (m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%') +
     ' · 平均 ' + fmtMs(m.avg_duration_ms) +
+    // 调用方中断单独显示：它不计入成功率（分母已排除），但运维必须看得到
+    // 「有多少请求是调用方自己走了」——否则这个数字会凭空消失。
+    (m.interrupted ? ' · 调用方中断 ' + fmtTok(m.interrupted) : '') +
     ' · 进行中 ' + String(m.in_flight || 0);
   $('reqNote').textContent = a.enabled
     ? 'JSONL 归档 ' + fmtBytes(a.bytes) + (a.dropped_writes ? ' · 丢弃 ' + a.dropped_writes + ' 条' : '') +

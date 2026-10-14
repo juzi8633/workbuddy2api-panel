@@ -26,6 +26,49 @@ func TestRecorderMetricsAndRecent(t *testing.T) {
 	}
 }
 
+// TestInterruptedNotCountedAsFailure 钉住「调用方中断不计入服务端失败率」。
+//
+// 这条是 wb24 自查时发现的**自身遗漏**：wb24 把客户端断开的分类改成了
+// client_canceled/499/interrupted，并在 CHANGELOG 里写下「不计入服务端失败率」，
+// 但 Failed = completed - succeeded 根本没看 outcome —— 499 不是 2xx、
+// outcome 也不是 success，于是它**依然被计入 failed**，面板成功率照样被拉低。
+// 只改分类不改度量，等于把「把调用方超时算成我们的故障」这句话换了个说法。
+//
+// 修复后：失败率的分母排除 interrupted（调用方走了，服务端无可归因之处），
+// 但 completed 仍计它——总数不能凭空少一条。
+func TestInterruptedNotCountedAsFailure(t *testing.T) {
+	r := New(Config{})
+	// 两条服务端成功
+	r.Begin()
+	r.Record(Event{RequestID: "ok1", Status: 200, OK: true, Outcome: OutcomeSuccess, DurationMs: 10})
+	r.Begin()
+	r.Record(Event{RequestID: "ok2", Status: 200, OK: true, Outcome: OutcomeSuccess, DurationMs: 10})
+	// 一条调用方中断（499）
+	r.Begin()
+	r.Record(Event{RequestID: "gone", Status: 499, OK: false, Outcome: OutcomeInterrupted, DurationMs: 5000})
+	// 一条真正的服务端失败
+	r.Begin()
+	r.Record(Event{RequestID: "bad", Status: 502, OK: false, Outcome: OutcomeHTTPError, DurationMs: 20})
+
+	s := r.Snapshot()
+	if s.Completed != 4 {
+		t.Fatalf("completed=%d want 4（总数不得少记）", s.Completed)
+	}
+	if s.Succeeded != 2 {
+		t.Fatalf("succeeded=%d want 2", s.Succeeded)
+	}
+	if s.Failed != 1 {
+		t.Fatalf("failed=%d want 1（只算真正的服务端失败；499/interrupted 不得计入）", s.Failed)
+	}
+	// 发生率口径：分母是「可归因于服务端的请求」= completed - interrupted = 3
+	if s.SuccessRate != 66.7 {
+		t.Fatalf("success_rate=%v want 66.7（=2/3，分母排除中断）", s.SuccessRate)
+	}
+	if s.Interrupted != 1 {
+		t.Fatalf("interrupted=%d want 1（中断单独可见，不是被丢掉）", s.Interrupted)
+	}
+}
+
 func TestArchiveRotationReadAndFilter(t *testing.T) {
 	dir := t.TempDir()
 	r := New(Config{Enabled: true, Dir: dir, FileMaxBytes: 120, MaxBytes: 1 << 20, RetentionDays: 7})
