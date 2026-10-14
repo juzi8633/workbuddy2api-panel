@@ -108,6 +108,19 @@ const upstreamTimeoutHint = "上游响应超时，网关已停止轮转（换号
 // UpstreamTimeoutHint 上游超时的 gateway_hint（与 upstream_timeout code 配套）。
 func UpstreamTimeoutHint() string { return upstreamTimeoutHint }
 
+// clientCanceledHint 调用方主动断开（或请求已被取消）的固定 hint。
+//
+// 必须与 noHealthyHint 区分：客户端自己走了（等不及、被上游拖太久后放弃、
+// 进程退出），网关**一个账号都没罚**，池子可能完全健康。此前这种情况落到末端
+// 默认分支报「池中没有可用的健康账号」，运维会去查余额/熔断/暂停，而真因在
+// 调用方侧 —— 方向完全相反。生产实证：axonhub/1.0 自带约 30s 超时，等响应
+// 阶段超时后有 14 条被误报成号池故障（当时 8/8 账号健康）。
+const clientCanceledHint = "调用方在响应完成前断开（客户端超时或主动取消），" +
+	"网关未惩罚任何账号；池内账号可能完全健康，请从调用方超时设置与请求耗时排查"
+
+// ClientCanceledHint 调用方断开的 gateway_hint（与 client_canceled code 配套）。
+func ClientCanceledHint() string { return clientCanceledHint }
+
 // ModelBlockedHint 模型级阻塞（每个账号都对该模型处于 11102/6004 冷却）的
 // hint 前缀；具体账号数与最早解封时间由 handler 拼接。
 //

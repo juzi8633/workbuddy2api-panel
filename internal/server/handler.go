@@ -972,13 +972,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
-			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
-			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
-			// 上游 client 已打 transport error 日志。
+			cliGone := r.Context().Err() != nil
+			// 客户端已走：**不罚账号**，也不再轮转。这一跳的失败是不可归因的——
+			// 是 ctx 取消打断了我们与上游之间的连接，不是上游真的连不上。此前它
+			// 与"网络抖动"共用 NoteFailures，于是同一个客户端连续 5 次超时就能把
+			// 一个健康账号推进连败降权（degrade_threshold=5），且理由写的是「网络
+			// 抖动」——把调用方的问题记到账号头上。生产形态：axonhub/1.0 自带约
+			// 30s 超时，等响应阶段超时会稳定产生这类"失败"。
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
-			h.cfg.Pool.NoteFailures(acct.UID)
+			if !cliGone {
+				// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的
+				// 失败」，连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
+				// 上游 client 已打 transport error 日志。
+				h.cfg.Pool.NoteFailures(acct.UID)
+			}
 			fail(acct.UID)
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避）
@@ -1207,6 +1216,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rc.Close()
 		if err != nil {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			// 客户端在聚合完成前断开：r.Context() 取消会打断我们读上游 body，
+			// Aggregate 于是报「读失败」。这**不是**上游解析缺陷——把它记成
+			// upstream_parse 502 等于替调用方认错，运维会去查上游协议兼容性。
+			// 实测证据：隔离实例上 max_tokens=4000 的非流式请求被 curl -m 6 掐断，
+			// 归档写出 upstream_parse/502，而上游一切正常。
+			if r.Context().Err() != nil {
+				writeOpenAIErrorHint(w, statusClientClosedRequest, "client_canceled",
+					"client canceled before the response completed", upstream.ClientCanceledHint())
+				st.status = statusClientClosedRequest
+				st.outcome = reqlog.OutcomeInterrupted
+				return
+			}
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
@@ -1259,16 +1280,33 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// （限流语义、客户端应等待重试），其余保持 503。本地调度类错误（无可用账号/
 	// 传输层抖动/非上游返回的 lastErr）→ 保留自有文案 no_healthy_account（本地错误
 	// 没有上游原文可透传，不编造）。
+	// 末态默认：本地调度类错误（池中无可用号 / 传输层抖动 / 非上游返回的 lastErr）
+	// 保留自有文案 no_healthy_account（本地错误没有上游原文可透传，不编造）。
 	status := http.StatusServiceUnavailable
 	code := "no_healthy_account"
 	msg := "all accounts are temporarily unavailable, please retry later"
-	// 上游超时：轮转已在传输层分支止损（见 isUpstreamTimeout），这里给一条**能区分**
-	// 的文案，别混进"没有可用账号"——两者的排查方向完全不同。
-	if errors.Is(lastErr, errUpstreamTimeout) {
+	// 归因顺序（先具体后泛化）：
+	//   ① 调用方主动断开 —— 判据是 **r.Context() 已取消**，与 lastErr 无关。
+	//      这一点必须看 ctx 而不是看错误：客户端断开时 lastErr 形态随所处阶段而变，
+	//      「等响应时断开」拿到的是 context.Canceled（会被 isUpstreamTimeout 依
+	//      clientGone=true 正确放行），而「还没选到号/租约被抢后 break」的出口
+	//      lastErr 是 nil 或别的值，按 lastErr 分类会漏。ctx 是唯一的共同事实。
+	//      生产危害不是计费（账号确实未被罚，见下方不变式），而是**排查方向被引向
+	//      账号池**：hint 说「池中没有可用的健康账号」，而当时 8/8 账号健康。
+	//      实证：axonhub/1.0 自带约 30s 超时，等响应阶段超时 → 14 条误报号池故障。
+	//   ② 上游超时 —— 轮转已在传输层分支止损（见 isUpstreamTimeout），给一条
+	//      **能区分**的文案，别混进"没有可用账号"：两者排查方向完全不同。
+	if r.Context().Err() != nil {
+		code = "client_canceled"
+		msg = "client canceled before the response completed"
+		// 499（nginx 惯例「客户端关闭请求」）而非 5xx：响应头尚未写出，客户端
+		// 基本已经走了，任何状态码都读不到；499 的价值在于让**运维统计**能把
+		// 「我们的错」与「调用方走了」分开，而不是把后者继续计入服务端故障。
+		status = statusClientClosedRequest
+	} else if errors.Is(lastErr, errUpstreamTimeout) {
 		code = "upstream_timeout"
 		msg = "upstream timed out: rotation stopped (another account would hit the same slow upstream), please retry later"
 	}
-	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）默认固定 no_healthy_account hint —— 但**上游超时不是调度
 	// 错误**：它是"上游停摆、轮转已主动止损"（见 isUpstreamTimeout），此时说
 	// 「池中没有可用的健康账号」会把排查引向账号池，而真实原因是上游侧，且我们
@@ -1278,7 +1316,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 据此决定要不要覆盖 msg（上游原文优先，含 requestId）。
 	upstreamMsgPassed := false
 	hint := upstream.NoHealthyAccountHint()
-	if errors.Is(lastErr, errUpstreamTimeout) {
+	if r.Context().Err() != nil {
+		// 与 code 同一判据（ctx 已取消），不得留 noHealthyHint：它是运维的排查
+		// 入口，留着「池中没有可用的健康账号」等于没修。
+		hint = upstream.ClientCanceledHint()
+	} else if errors.Is(lastErr, errUpstreamTimeout) {
 		hint = upstream.UpstreamTimeoutHint()
 	} else if errors.As(lastErr, &ue) {
 		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
@@ -1319,7 +1361,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//
 	// 用 400 而非 503：这是"你选的这个模型当前不可用"，不是"服务端暂时过载"。
 	// 换号重试必然同样失败，客户端不该按可重试错误处理。
-	if modelBlock.Blocked {
+	// 客户已断开时不让模型级阻塞覆盖分类：调用方已经走了，此时把 499 改成 400
+	// 「该模型在所有账号上均冷却」同样是把「调用方放弃」记成上游调度问题。
+	clientGone := r.Context().Err() != nil
+	if modelBlock.Blocked && !clientGone {
 		code = "model_unavailable"
 		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
 		// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
@@ -1335,7 +1380,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
-	st.outcome = reqlog.OutcomeHTTPError
+	// outcome 决定这条请求在运维统计里算「服务端失败」还是「调用方中断」。
+	// 客户端断开必须归 interrupted（与流式中途断连同一口径），否则 499 仍会被
+	// 计入 http_error 失败率，「把调用方超时算成我们的故障」这条缺陷只是换了个
+	// 状态码、并没有修好。
+	if clientGone {
+		st.outcome = reqlog.OutcomeInterrupted
+	} else {
+		st.outcome = reqlog.OutcomeHTTPError
+	}
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。

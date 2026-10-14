@@ -53,7 +53,7 @@ import (
 // 上游 CI 有一条 tag 断言会 `SRC="${SRC%-panel}"` 后比 tag，因此带 "+特性" 的后缀
 // 本就不满足它（我们从没跑过上游 CI）。改成 "-wbN" 同样不满足，但至少是**有意**的
 // 命名，而不是把三件事塞进一个串的副产品。
-const appVersion = "1.13.0-wb23"
+const appVersion = "1.13.0-wb24"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。

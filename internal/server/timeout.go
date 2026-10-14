@@ -12,6 +12,16 @@ import (
 // 排查方向完全不同（前者是上游慢/卡，后者是池里没有可用号）。
 var errUpstreamTimeout = errors.New("upstream timeout")
 
+// statusClientClosedRequest 是 nginx 的 499 惯例：客户端在响应完成前关闭了请求。
+//
+// 为什么不用 5xx：客户端断开时响应头通常还没写出，状态码基本送不到调用方，它的
+// 价值全在**运维统计**——499 让监控把「调用方自己走了」与「服务端过载/号池故障」
+// 分开。此前这种情况走末端默认分支报 503 no_healthy_account，于是调用方超时被
+// 计入服务端故障率，并把排查引向账号池（生产实证：axonhub 等响应超时 14 条）。
+//
+// Go 标准库没有这个常量（它只到 511），故本地定义；命名沿用标准库风格。
+const statusClientClosedRequest = 499
+
 // isUpstreamTimeout 判定传输层错误是否属于「上游超时 / 停滞」这一类。
 //
 // 为什么需要单独判定：超时不是账号的问题。同一份请求换到别的账号，撞上的是同一个
