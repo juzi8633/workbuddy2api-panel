@@ -259,12 +259,26 @@ function rateLimitMeta(row, now) {
       title: model + '\n模型当前不可用' + (deadline ? '\n最早重试：' + fmtLocalDateTime(deadline) : ''),
     };
   }
-  let detail = resetAt
-    ? '预计 ' + fmtLocalDateTime(resetAt) + ' 解封' + (remaining ? '（剩余 ' + dur(remaining) + '）' : '')
-    : (until ? '预计 ' + fmtLocalDateTime(until) + ' 恢复（剩余 ' + dur(remaining) + '）' : '预计解封时间未知');
+  // 双时钟（issue #171 第二半）：reset_at 是上游承诺的恢复时刻，until 是网关自己
+  // 的解锁时刻（= min(reset_at, now + soft_rate_max)，防止超长限流拖死全池）。
+  // 黄框的出现/消失只由 until 决定，所以 until < reset_at 时**两个时刻都要报**，
+  // 否则文字（上游口径）与实际掉框时刻不一致 —— 用户看到「预计 02:51 解封」却在
+  // 01:52 就掉框，一发请求又弹回来，无法判断该信哪个（上游实测偏差 3m56s~1h15m）。
+  // 主文字以 until 为准（与实际行为一致），并把上游口径一并写明。
+  const untilRemaining = until ? Math.max(0, Math.round((until - now) / 1000)) : 0;
+  let detail;
+  if (until && resetAt && until < resetAt) {
+    detail = '上游称 ' + fmtLocalDateTime(resetAt) + ' 恢复 · 网关 ' + fmtLocalDateTime(until) + ' 起重试' +
+      (untilRemaining ? '（剩余 ' + dur(untilRemaining) + '）' : '');
+  } else if (resetAt) {
+    detail = '预计 ' + fmtLocalDateTime(resetAt) + ' 解封' + (remaining ? '（剩余 ' + dur(remaining) + '）' : '');
+  } else if (until) {
+    detail = '预计 ' + fmtLocalDateTime(until) + ' 恢复（剩余 ' + dur(remaining) + '）';
+  } else {
+    detail = '预计解封时间未知';
+  }
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
   if (until && resetAt && until < resetAt) {
-    detail += ' · 网关最快 ' + dur(Math.max(0, Math.round((until - now) / 1000))) + ' 后重试';
     title.push('网关最早重试：' + fmtLocalDateTime(until));
   }
   return { model, kind, detail, title: title.join('\n') };

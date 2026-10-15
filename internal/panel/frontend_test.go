@@ -212,9 +212,53 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("rate-limit formatting node test failed: %v\n%s", err, out)
 	}
-	const want = `{"rate":"预计 2026-09-28 16:00 解封（剩余 2时00分） · 网关最快 1时00分 后重试","unavailable":"预计 1时00分 后重试","unknown":"预计解封时间未知"}`
+	// 上游 issue #171 第二半：`until < resetAt` 时，主文字必须**同时**给出两个
+	// 时刻并标明口径。改前主文字只写 resetAt 的「解封时间」，而黄框的消失由
+	// until 决定（= min(resetAt, now+soft_rate_max)）—— 上游承诺时间超过 2h 时，
+	// 文字与掉框时刻必然不一致（上游实测偏差 3m56s ~ 1h15m），掉框后一发请求又
+	// 弹回来，用户无法判断该信哪个。
+	const want = `{"rate":"上游称 2026-09-28 16:00 恢复 · 网关 2026-09-28 15:00 起重试（剩余 1时00分）","unavailable":"预计 1时00分 后重试","unknown":"预计解封时间未知"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("rate-limit formatting=%s want %s", out, want)
+	}
+}
+
+// 上游未给 reset_at（只有网关 until）时不得出现「上游称」字样 —— 那时并没有
+// 上游口径可报，编一个出来比不报更糟。
+func TestAppJSRateLimitMetaUntilOnly(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; rate limit formatting test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function dur(');
+const end = src.indexOf('function rateLimitRowsHtml');
+const ctx = { Date, Number, String, Math };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
+const now = new Date(2026, 8, 28, 14, 0, 0).getTime();
+const until = new Date(2026, 8, 28, 15, 0, 0).getTime();
+const onlyUntil = ctx.rateLimitMeta({ model: 'glm-5.3', kind: 'rate_limit', until: new Date(until).toISOString() }, now);
+const equalBoth = ctx.rateLimitMeta({ model: 'glm-5.3', kind: 'rate_limit',
+  reset_at: new Date(until).toISOString(), until: new Date(until).toISOString() }, now);
+process.stdout.write(JSON.stringify({ onlyUntil: onlyUntil.detail, equalBoth: equalBoth.detail }));`
+	f, err := os.CreateTemp(t.TempDir(), "rate-limit-until-only-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rate-limit until-only test failed: %v\n%s", err, out)
+	}
+	const want = `{"onlyUntil":"预计 2026-09-28 15:00 恢复（剩余 1时00分）","equalBoth":"预计 2026-09-28 15:00 解封（剩余 1时00分）"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("rate-limit until-only=%s want %s", out, want)
 	}
 }
 

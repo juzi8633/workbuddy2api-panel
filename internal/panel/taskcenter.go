@@ -431,6 +431,16 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	if before.Claimed {
 		return "已完成（已领取）", nil
 	}
+	// 达标未领（issue #174）：直接补领，**不重跑行为动作**。
+	// 队列此前无条件先跑一遍动作再回读领奖；对已达标的任务这是纯浪费，且一次性
+	// 任务的动作重跑可能失败，使这条「本该只是补领」的路径变成永远领不到。
+	if before.Current >= before.Target && before.Target > 0 {
+		credit, energy, cerr := p.claimTask(a, code, isMP)
+		if cerr != nil {
+			return "", fmt.Errorf("达标但领奖失败: %w", cerr)
+		}
+		return fmt.Sprintf("达标补领（%s）奖励 +%d 分 +%d 能", taskProgressText(before), credit, energy), nil
+	}
 	msg, err := act.run(p, a)
 	if err != nil {
 		return "", err

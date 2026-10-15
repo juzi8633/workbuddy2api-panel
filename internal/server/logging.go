@@ -610,24 +610,56 @@ var cacheMissWarn = &cacheMissSignal{everHit: map[string]bool{}, last: map[strin
 // cacheMissWarnEvery 冷却间隔；变量供测试缩短。
 var cacheMissWarnEvery = 10 * time.Minute
 
-// noteCacheTokens 记录一次观测：有命中 → 标记该模型可命中；整段未命中且此前
-// 命中过 → 触发 WARN（冷却内不重复）。
+// cacheMissWarnRatio 有效命中率低于此比例才算「整段未命中」。
+// 0.1 = 10%（与「整段重算」的语义相符：零星几个 token 未命中不是重算）。
+const cacheMissWarnRatio = 0.1
+
+// noteCacheTokens 记录一次观测：有命中 → 标记该模型可命中；**有效**命中率极低
+// 且此前命中过 → 触发 WARN（冷却内不重复）。
+//
+// 判据以**有效命中** effHit = prompt − miss 为准，而不是只看 hit 是否为 0。
+// 上游 issue #170 的假阳性正来自只看 hit：上游在 usage 里显式回
+// `prompt_cache_miss_tokens=3`（只重算 3 个 token、命中率 99.99%），而 hit 字段
+// 为 0 或缺席，就被判成「大前缀整段未命中」，打出「费用会显著升高」的告警——
+// 用户按告警去查缓存查不到任何问题。非流式路径（handler 的
+// UsageCacheHitTokens）只要命中字段存在就置 hasCache=true，恰好会把
+// `hit=0, miss=3` 这组自相矛盾的数值原样送进来。
+//
+// 反推必须双向对称（此前只做了单向）：
+//   - miss 缺失  → miss = prompt − hit（全量未命中）
+//   - hit 缺失/0 → hit  = prompt − miss（miss 明确时以 miss 为准）
+//
+// 两者都缺失（都是 0）时按「全量未命中」处理，保持既有告警语义不回归。
 func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64) {
 	if model == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if hit > 0 {
-		c.everHit[model] = true
-		return
+	// 有效命中：prompt 与 miss 都有意义时，miss 是最可信的「未命中」权威值
+	// （上游显式给出）。hit 只作为 miss 缺失时的补充。
+	effHit := hit
+	// 上游**显式**回了 miss 时以它为准反推：miss 是「未命中」的权威值，而同一份
+	// usage 里的 hit 可能缺席或为 0（#170 的现场就是 hit=0、miss=3）。取两者反推的
+	// 较大值，既修掉假阳性，也不会因为上游只回 hit 而漏掉真未命中。
+	if prompt > 0 && miss > 0 {
+		if h := prompt - miss; h > effHit {
+			effHit = h
+		}
 	}
-	// hit==0 才可能是整段重算。小前缀（<1000 tok）的 miss 无告警价值；上游未回
-	// miss 字段时按 prompt 全量视为未命中。
+	if effHit > 0 {
+		// 有任何有效命中 → 该模型可命中。命中率足够高时直接返回（不告警）。
+		c.everHit[model] = true
+		if prompt <= 0 || float64(effHit)/float64(prompt) >= cacheMissWarnRatio {
+			return
+		}
+	}
+	// 走到这里 = 有效命中率 <10%（或全 0）。小前缀（<1000 tok）的 miss 无告警价值。
 	if prompt < 1000 {
 		return
 	}
 	if miss <= 0 {
+		// miss 缺失：按 prompt 全量视为未命中（既有语义）。
 		miss = prompt
 	}
 	if !c.everHit[model] {

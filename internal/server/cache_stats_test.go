@@ -77,3 +77,60 @@ func TestCacheMissSignal(t *testing.T) {
 	// miss 缺失（上游只回 hit=0、无 miss、无 prompt）不触发。
 	cacheMissWarn.noteCacheTokens("glm-5.3", 0, 0, 0)
 }
+
+// TestCacheMissNoFalsePositive 钉住上游 issue #170 的假阳性。
+//
+// 生产实证（上游报告）：上游在 usage 里显式回 `prompt_cache_miss_tokens=3`，
+// 即「只重算了 3 个 token」、命中率 99.99%，却被判成「本次大前缀整段未命中」
+// 并打出「费用会显著升高」的告警。用户按这条告警去查缓存，查不到任何问题。
+//
+// 根因：判据**只看 hit、从不看 miss**。反推只做了单向
+// （`miss 缺失 → miss = prompt`），缺了对称的另一半
+// （`hit 缺失/为 0 且 miss > 0 → hit = prompt - miss`）。
+// 非流式路径（handler 的 UsageCacheHitTokens）只要命中字段存在就置 hasCache=true，
+// 会把 `hit=0, miss=3` 这组自相矛盾的数值原样送进来 → 告警。
+//
+// 修好后判据应以**有效命中**为准：effHit = prompt - miss；只有当 effHit 占比极低
+// 才算整段重算。
+func TestCacheMissNoFalsePositive(t *testing.T) {
+	old := cacheMissWarnEvery
+	cacheMissWarnEvery = time.Hour
+	t.Cleanup(func() {
+		cacheMissWarnEvery = old
+		cacheMissWarn = &cacheMissSignal{everHit: map[string]bool{}, last: map[string]time.Time{}}
+	})
+	cacheMissWarn = &cacheMissSignal{everHit: map[string]bool{}, last: map[string]time.Time{}}
+
+	// 先观测到一次真命中，让该模型进入「曾命中」集合（告警前置条件）。
+	cacheMissWarn.noteCacheTokens("gpt-6-luna", 52703, 50000, 2703)
+	if cacheMissWarn.last["gpt-6-luna"] != (time.Time{}) {
+		t.Fatal("真命中不应触发告警")
+	}
+
+	// 上游显式回 miss=3（= 只重算 3 个 token），hit 字段为 0 → 命中率 99.99%。
+	cacheMissWarn.noteCacheTokens("gpt-6-luna", 52703, 0, 3)
+	if !cacheMissWarn.last["gpt-6-luna"].IsZero() {
+		t.Fatalf("假阳性：miss=3/prompt=52703（命中率 99.99%%）不应告警")
+	}
+
+	// 对称边界：hit 与 miss 都缺失时按「全量未命中」处理（保持既有语义）。
+	cacheMissWarn = &cacheMissSignal{everHit: map[string]bool{"m": true}, last: map[string]time.Time{}}
+	cacheMissWarn.noteCacheTokens("m", 8500, 0, 0)
+	if cacheMissWarn.last["m"].IsZero() {
+		t.Fatal("hit 与 miss 都缺失应按全量未命中告警（既有语义不得回归）")
+	}
+
+	// 真整段未命中仍必须告警（不得因这次放宽而漏报）。
+	cacheMissWarn = &cacheMissSignal{everHit: map[string]bool{"n": true}, last: map[string]time.Time{}}
+	cacheMissWarn.noteCacheTokens("n", 8500, 0, 8500)
+	if cacheMissWarn.last["n"].IsZero() {
+		t.Fatal("真整段未命中必须仍然告警")
+	}
+
+	// 部分命中但极低（<10%）仍属「大前缀整段未命中」的语义范围，要告警。
+	cacheMissWarn = &cacheMissSignal{everHit: map[string]bool{"p": true}, last: map[string]time.Time{}}
+	cacheMissWarn.noteCacheTokens("p", 10000, 0, 9500) // effHit = 5%
+	if cacheMissWarn.last["p"].IsZero() {
+		t.Fatal("有效命中率 5% 应告警")
+	}
+}

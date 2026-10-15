@@ -234,6 +234,17 @@ func (p *Panel) taskByCode(a *auth.Auth, code string) (*upstream.Task, error) {
 	return nil, nil
 }
 
+// claimTask 领取单个任务的奖励，自动按任务码选对端点（mp 专属码走 mp 口径）。
+//
+// 抽成一处是为了让「跑完动作后领奖」与「达标补领（issue #174）」共用同一口径——
+// 领奖端点选错时 mp 任务会 task not found，而两条路径各自内联一份时极易只改一处。
+func (p *Panel) claimTask(a *auth.Auth, code string, isMP bool) (credit, energy int64, err error) {
+	if isMP {
+		return p.cfg.Upstream.ClaimRewardMP(a, code)
+	}
+	return p.cfg.Upstream.ClaimReward(a, code)
+}
+
 // claimPollAttempts / claimPollGap 达标回读的有界轮询参数。
 // 背景：上游计分是**异步**的——行为事件上报后进度要数秒才刷新（实测 Model_chat
 // 对话完成后立即回读仍是 0/1，约 5-8 秒后才变 1/1）。一次性回读会误判"未达标"，
@@ -1180,9 +1191,26 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			out = append(out, item)
 			continue
 		}
-		if before.Claimed || before.Current >= before.Target && before.Target > 0 {
+		if before.Claimed {
 			item["status"] = "skipped"
 			item["message"] = "已完成（" + taskProgressText(before) + "）"
+			out = append(out, item)
+			continue
+		}
+		// 达标未领（issue #174）：**只领奖，不重跑行为动作**。
+		//
+		// 此前这里把「已达标」与「已领取」合并成同一个 skip 分支，于是达标未领的
+		// 任务在「一键完成」里被静默跳过、积分永远停在原地（上游实测卡在
+		// 2000/2100/2300 上不去 4000）。达标后再跑一遍行为动作不但浪费配额，
+		// 一次性任务的动作还可能直接失败——那正是「永远领不到」的成因之一。
+		if before.Current >= before.Target && before.Target > 0 {
+			if credit, energy, cerr := p.claimTask(a, act.TaskCode, isMPTaskCode(act.TaskCode)); cerr != nil {
+				item["status"] = "error"
+				item["message"] = "达标但领奖失败: " + cerr.Error()
+			} else {
+				item["status"] = "done"
+				item["message"] = "达标补领（" + taskProgressText(before) + fmt.Sprintf("）奖励 +%d 分 +%d 能", credit, energy)
+			}
 			out = append(out, item)
 			continue
 		}
